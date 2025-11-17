@@ -122,6 +122,48 @@ Configure value mappings:
 - 4 → "Restarting" (orange)
 - 5 → "Dead" (red)
 
+## Testing
+
+### Run All Tests
+
+```bash
+pytest
+```
+
+### Run with Coverage Report
+
+```bash
+pytest --cov=app --cov-report=html --cov-report=term
+```
+
+### Run Specific Test File
+
+```bash
+pytest tests/test_enums.py
+```
+
+### Run Specific Test
+
+```bash
+pytest tests/test_enums.py::TestContainerState::test_running_value
+```
+
+### Run Tests with Verbose Output
+
+```bash
+pytest -v
+```
+
+### Test Structure
+
+- `tests/test_enums.py` - Enum value mappings
+- `tests/test_exporter.py` - PortainerExporter initialization and helpers
+- `tests/test_api.py` - Portainer API interactions (mocked)
+- `tests/test_metrics.py` - Metrics generation and output format
+- `tests/test_handlers.py` - HTTP request handlers
+
+Coverage is currently **95%+** across the codebase.
+
 ## Requirements
 
 - Python 3.11+

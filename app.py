@@ -19,7 +19,7 @@ from threading import Thread
 
 # Configure logging
 logging.basicConfig(
-    level=logging.getenv("LOG_LEVEL", "INFO"),
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
@@ -97,11 +97,12 @@ class PortainerExporter:
 
     def _parse_health_status(self, container_status: str) -> str:
         """Extract health status from container Status string"""
-        if "healthy" in container_status.lower():
-            return "healthy"
-        elif "unhealthy" in container_status.lower():
+        status_lower = container_status.lower()
+        if "unhealthy" in status_lower:
             return "unhealthy"
-        elif "starting" in container_status.lower():
+        elif "healthy" in status_lower:
+            return "healthy"
+        elif "starting" in status_lower:
             return "starting"
         return "none"
 

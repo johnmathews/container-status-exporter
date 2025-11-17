@@ -14,10 +14,13 @@ A Prometheus exporter that exports Docker container status (running, paused, exi
 ## Metrics
 
 ### Container State
+
 ```
 container_state{container_name="...", hostname="...", image="..."}
 ```
+
 Values:
+
 - 0 = exited
 - 1 = running
 - 2 = paused
@@ -27,21 +30,26 @@ Values:
 - 6 = unknown
 
 ### Container Health
+
 ```
 container_health{container_name="...", hostname="...", image="..."}
 ```
+
 Values:
+
 - 0 = none (no health check)
 - 1 = healthy
 - 2 = unhealthy
 - 3 = starting
 
 ### Container Restart Count
+
 ```
 container_restart_count{container_name="...", hostname="...", image="..."}
 ```
 
 ### Exporter Status
+
 ```
 portainer_exporter_up           # 1 if connected to Portainer, 0 if error
 portainer_exporter_last_scrape_timestamp  # Unix timestamp of last successful scrape
@@ -97,13 +105,13 @@ Add to your Prometheus `prometheus.yml`:
 
 ```yaml
 scrape_configs:
-  - job_name: 'container-status'
+  - job_name: "container-status"
     scrape_interval: 30s
     scrape_timeout: 15s
     static_configs:
-      - targets: ['192.168.2.106:8081']
+      - targets: ["192.168.2.106:8081"]
         labels:
-          hostname: 'infra'
+          hostname: "infra"
 ```
 
 ## Integration with Grafana
@@ -115,6 +123,7 @@ container_state{hostname=~"$hostname"}
 ```
 
 Configure value mappings:
+
 - 0 → "Exited" (gray)
 - 1 → "Running" (green)
 - 2 → "Paused" (yellow)
@@ -174,14 +183,17 @@ Coverage is currently **95%+** across the codebase.
 ## Troubleshooting
 
 ### "PORTAINER_TOKEN environment variable is required"
+
 Make sure the PORTAINER_TOKEN environment variable is set.
 
 ### "Failed to fetch endpoints"
+
 - Check PORTAINER_URL is correct and accessible
 - Verify PORTAINER_TOKEN is valid (regenerate if needed)
 - Check network connectivity
 
 ### Metrics not updating
+
 - Check logs: `docker logs container-status-exporter`
 - Verify Portainer is accessible from the container
 - Check the /health endpoint for errors

@@ -11,7 +11,7 @@ import sys
 import time
 import logging
 import requests
-from typing import Dict, List, Any
+from typing import Any, cast
 from dataclasses import dataclass
 from enum import Enum
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -61,22 +61,22 @@ class ContainerMetrics:
 class PortainerExporter:
     """Main exporter class for Portainer API"""
 
-    def __init__(self):
-        self.portainer_url = os.getenv("PORTAINER_URL", "http://localhost:9000").rstrip(
-            "/"
-        )
-        self.portainer_token = os.getenv("PORTAINER_TOKEN", "")
-        self.scrape_interval = int(os.getenv("SCRAPE_INTERVAL", "30"))
-        self.listen_port = int(os.getenv("LISTEN_PORT", "8081"))
+    def __init__(self) -> None:
+        self.portainer_url: str = os.getenv(
+            "PORTAINER_URL", "http://localhost:9000"
+        ).rstrip("/")
+        self.portainer_token: str = os.getenv("PORTAINER_TOKEN", "")
+        self.scrape_interval: int = int(os.getenv("SCRAPE_INTERVAL", "30"))
+        self.listen_port: int = int(os.getenv("LISTEN_PORT", "8081"))
 
         if not self.portainer_token:
             raise ValueError("PORTAINER_TOKEN environment variable is required")
 
-        self.session = requests.Session()
+        self.session: requests.Session = requests.Session()
         self.session.headers.update({"X-API-Key": self.portainer_token})
-        self.metrics: List[ContainerMetrics] = []
-        self.last_error = None
-        self.last_update = 0
+        self.metrics: list[ContainerMetrics] = []
+        self.last_error: str | None = None
+        self.last_update: float = 0
 
     def _get_state_value(self, state: str) -> int:
         """Convert Docker state string to numeric value"""
@@ -111,20 +111,26 @@ class PortainerExporter:
             return "starting"
         return "none"
 
-    def fetch_endpoints(self) -> List[Dict[str, Any]]:
+    def fetch_endpoints(self) -> list[dict[str, Any]]:
         """Fetch all endpoints (Docker hosts) from Portainer"""
         try:
             url = f"{self.portainer_url}/api/endpoints"
             response = self.session.get(url, timeout=10)
             response.raise_for_status()
-            endpoints = response.json()
+            data: Any = response.json()
 
             # Handle both list and paginated responses
-            if isinstance(endpoints, dict) and "results" in endpoints:
-                endpoints = endpoints["results"]
+            if isinstance(data, dict) and "results" in data:
+                data = data["results"]
 
+            # Type guard to ensure we have a list
+            if not isinstance(data, list):
+                return []
+
+            # Cast to proper type since we've validated it's a list
+            endpoints: list[dict[str, Any]] = cast(list[dict[str, Any]], data)
             logger.info(f"Found {len(endpoints)} endpoints")
-            return endpoints if isinstance(endpoints, list) else []
+            return endpoints
         except requests.RequestException as e:
             logger.error(f"Failed to fetch endpoints: {e}")
             self.last_error = str(e)
@@ -132,31 +138,59 @@ class PortainerExporter:
 
     def fetch_containers(
         self, endpoint_id: int, hostname: str
-    ) -> List[ContainerMetrics]:
+    ) -> list[ContainerMetrics]:
         """Fetch all containers from a specific endpoint"""
-        containers = []
+        containers: list[ContainerMetrics] = []
         try:
             url = f"{self.portainer_url}/api/endpoints/{endpoint_id}/docker/containers/json?all=true"
             response = self.session.get(url, timeout=10)
             response.raise_for_status()
-            container_list = response.json()
+            data: Any = response.json()
+
+            # Ensure we have a list
+            if not isinstance(data, list):
+                return containers
+
+            container_list: list[Any] = cast(list[Any], data)
 
             for container in container_list:
-                state = container.get("State", "unknown").lower()
-                status = container.get("Status", "")
-                health = self._parse_health_status(status)
-                restart_count = container.get("RestartCount", 0)
+                if not isinstance(container, dict):
+                    continue
+
+                state_value: str = container.get("State", "unknown")
+                if not isinstance(state_value, str):
+                    state_value = "unknown"
+                state: str = state_value.lower()
+
+                status_value: str = container.get("Status", "")
+                if not isinstance(status_value, str):
+                    status_value = ""
+                status: str = status_value
+
+                health: str = self._parse_health_status(status)
+
+                restart_count_value: int = container.get("RestartCount", 0)
+                if not isinstance(restart_count_value, int):
+                    restart_count_value = 0
+                restart_count: int = restart_count_value
 
                 # Extract container name (remove leading slash)
-                names = container.get("Names", [])
-                container_name = names[0].lstrip("/") if names else "unknown"
+                names_value: Any = container.get("Names", [])
+                names: list[str] = []
+                if isinstance(names_value, list):
+                    names = cast(list[str], names_value)
+
+                container_name: str = names[0].lstrip("/") if names else "unknown"
 
                 # Get image name
-                image = container.get("Image", "unknown")
+                image_value: str = container.get("Image", "unknown")
+                if not isinstance(image_value, str):
+                    image_value = "unknown"
+                image: str = image_value
 
                 metrics = ContainerMetrics(
                     name=container_name,
-                    hostname=hostname,
+                    hostname=hostname.lower(),
                     image=image,
                     state=self._get_state_value(state),
                     health=self._get_health_value(health),
@@ -178,8 +212,17 @@ class PortainerExporter:
             endpoints = self.fetch_endpoints()
 
             for endpoint in endpoints:
-                endpoint_id = endpoint.get("Id")
-                hostname = endpoint.get("Name", "unknown")
+                endpoint_id_value: Any = endpoint.get("Id", 0)
+                endpoint_id: int = (
+                    endpoint_id_value if isinstance(endpoint_id_value, int) else 0
+                )
+
+                hostname_value: Any = endpoint.get("Name", "unknown")
+                hostname: str = (
+                    hostname_value if isinstance(hostname_value, str) else "unknown"
+                )
+                hostname = hostname.lower()
+
                 containers = self.fetch_containers(endpoint_id, hostname)
                 self.metrics.extend(containers)
 
@@ -192,7 +235,7 @@ class PortainerExporter:
 
     def generate_metrics_output(self) -> str:
         """Generate Prometheus metrics in text format"""
-        output = []
+        output: list[str] = []
 
         # Add HELP and TYPE comments
         output.append(
@@ -201,7 +244,7 @@ class PortainerExporter:
         output.append("# TYPE container_state gauge")
 
         for metric in self.metrics:
-            labels = f'container_name="{metric.name}",hostname="{metric.hostname}",image="{metric.image}"'
+            labels: str = f'container_name="{metric.name}",hostname="{metric.hostname.lower()}",image="{metric.image}"'
             output.append(f"container_state{{{labels}}} {metric.state}")
 
         output.append("")
@@ -211,7 +254,7 @@ class PortainerExporter:
         output.append("# TYPE container_health gauge")
 
         for metric in self.metrics:
-            labels = f'container_name="{metric.name}",hostname="{metric.hostname}",image="{metric.image}"'
+            labels = f'container_name="{metric.name}",hostname="{metric.hostname.lower()}",image="{metric.image}"'
             output.append(f"container_health{{{labels}}} {metric.health}")
 
         output.append("")
@@ -221,7 +264,7 @@ class PortainerExporter:
         output.append("# TYPE container_restart_count gauge")
 
         for metric in self.metrics:
-            labels = f'container_name="{metric.name}",hostname="{metric.hostname}",image="{metric.image}"'
+            labels = f'container_name="{metric.name}",hostname="{metric.hostname.lower()}",image="{metric.image}"'
             output.append(f"container_restart_count{{{labels}}} {metric.restart_count}")
 
         output.append("")
@@ -229,7 +272,7 @@ class PortainerExporter:
             "# HELP portainer_exporter_up Whether the exporter is up and connected to Portainer"
         )
         output.append("# TYPE portainer_exporter_up gauge")
-        up_status = 1 if self.last_error is None else 0
+        up_status: int = 1 if self.last_error is None else 0
         output.append(f"portainer_exporter_up {up_status}")
 
         output.append("")
@@ -247,30 +290,32 @@ class PortainerExporter:
 class MetricsHandler(BaseHTTPRequestHandler):
     """HTTP request handler for /metrics endpoint"""
 
-    exporter = None
+    exporter: PortainerExporter | None = None
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.path == "/metrics":
             self.send_response(200)
             self.send_header("Content-type", "text/plain; version=0.0.4")
             self.end_headers()
-            metrics = self.exporter.generate_metrics_output()
-            self.wfile.write(metrics.encode("utf-8"))
+            if self.exporter is not None:
+                metrics = self.exporter.generate_metrics_output()
+                _ = self.wfile.write(metrics.encode("utf-8"))
         elif self.path == "/health":
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
             import json
 
-            health = json.dumps(
-                {"status": "up", "last_error": self.exporter.last_error}
-            )
-            self.wfile.write(health.encode("utf-8"))
+            if self.exporter is not None:
+                health = json.dumps(
+                    {"status": "up", "last_error": self.exporter.last_error}
+                )
+                _ = self.wfile.write(health.encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
 
-    def log_message(self, format, *args):
+    def log_message(self, format: str, *args: Any) -> None:  # type: ignore[override]
         """Suppress default logging"""
         pass
 
@@ -303,7 +348,7 @@ def main():
         logger.info(
             f"Starting background collection every {exporter.scrape_interval} seconds"
         )
-        run_collector_thread(exporter, exporter.scrape_interval)
+        _ = run_collector_thread(exporter, exporter.scrape_interval)
 
         # Start HTTP server
         server = HTTPServer(("0.0.0.0", exporter.listen_port), MetricsHandler)

@@ -163,3 +163,196 @@ class TestParseHealthStatus:
     def test_parse_empty_string(self, exporter):
         """Test parsing empty string returns 'none'."""
         assert exporter._parse_health_status("") == "none"
+
+
+class TestHostnameLowercase:
+    """Test that hostnames are always lowercase in metrics."""
+
+    @pytest.fixture
+    def exporter(self, mock_env):
+        """Create an exporter instance."""
+        with patch.dict("os.environ", mock_env):
+            return PortainerExporter()
+
+    def test_fetch_containers_lowercases_hostname(self, exporter, mocker):
+        """Test that fetch_containers converts hostname to lowercase."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "Id": "abc123",
+                "Names": ["/test-container"],
+                "Image": "nginx:latest",
+                "State": "running",
+                "Status": "Up 2 hours",
+                "RestartCount": 0,
+            }
+        ]
+        mocker.patch.object(exporter.session, "get", return_value=mock_response)
+
+        # Pass uppercase hostname
+        metrics = exporter.fetch_containers(1, "MyDockerHost")
+        
+        assert len(metrics) == 1
+        assert metrics[0].hostname == "mydockerhost"
+
+    def test_fetch_containers_preserves_lowercase_hostname(self, exporter, mocker):
+        """Test that lowercase hostnames remain lowercase."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "Id": "abc123",
+                "Names": ["/test-container"],
+                "Image": "nginx:latest",
+                "State": "running",
+                "Status": "Up 2 hours",
+                "RestartCount": 0,
+            }
+        ]
+        mocker.patch.object(exporter.session, "get", return_value=mock_response)
+
+        metrics = exporter.fetch_containers(1, "docker-host-1")
+        
+        assert len(metrics) == 1
+        assert metrics[0].hostname == "docker-host-1"
+
+    def test_fetch_containers_mixed_case_hostname(self, exporter, mocker):
+        """Test that mixed case hostnames are converted to lowercase."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "Id": "abc123",
+                "Names": ["/test-container"],
+                "Image": "nginx:latest",
+                "State": "running",
+                "Status": "Up 2 hours",
+                "RestartCount": 0,
+            }
+        ]
+        mocker.patch.object(exporter.session, "get", return_value=mock_response)
+
+        metrics = exporter.fetch_containers(1, "DockerHost-01")
+        
+        assert len(metrics) == 1
+        assert metrics[0].hostname == "dockerhost-01"
+
+    def test_multiple_containers_same_host_lowercase(self, exporter, mocker):
+        """Test that multiple containers from same host all have lowercase hostname."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = [
+            {
+                "Id": "abc123",
+                "Names": ["/web"],
+                "Image": "nginx:latest",
+                "State": "running",
+                "Status": "Up 2 hours",
+                "RestartCount": 0,
+            },
+            {
+                "Id": "def456",
+                "Names": ["/db"],
+                "Image": "postgres:15",
+                "State": "running",
+                "Status": "Up 2 hours",
+                "RestartCount": 0,
+            },
+            {
+                "Id": "ghi789",
+                "Names": ["/cache"],
+                "Image": "redis:7",
+                "State": "running",
+                "Status": "Up 2 hours",
+                "RestartCount": 0,
+            },
+        ]
+        mocker.patch.object(exporter.session, "get", return_value=mock_response)
+
+        metrics = exporter.fetch_containers(1, "MyProd-Server")
+        
+        assert len(metrics) == 3
+        for metric in metrics:
+            assert metric.hostname == "myprod-server"
+            assert metric.hostname.islower()
+
+    def test_metrics_output_has_lowercase_hostnames(self, exporter):
+        """Test that generated metrics output contains lowercase hostnames."""
+        from app import ContainerMetrics
+        
+        # Manually set metrics with mixed case hostnames
+        exporter.metrics = [
+            ContainerMetrics(
+                name="web-server",
+                hostname="MyDockerHost",
+                image="nginx:latest",
+                state=1,
+                health=1,
+                restart_count=0,
+            ),
+            ContainerMetrics(
+                name="database",
+                hostname="PROD-SERVER",
+                image="postgres:15",
+                state=1,
+                health=1,
+                restart_count=0,
+            ),
+        ]
+        
+        output = exporter.generate_metrics_output()
+        
+        # Check that output contains lowercase hostnames
+        assert 'hostname="mydockerhost"' in output
+        assert 'hostname="prod-server"' in output
+        # Ensure no uppercase hostnames in output
+        assert 'hostname="MyDockerHost"' not in output
+        assert 'hostname="PROD-SERVER"' not in output
+
+    def test_collect_all_metrics_produces_lowercase_hostnames(self, exporter, mocker, sample_endpoints):
+        """Test that collect_all_metrics ensures all hostnames are lowercase."""
+        # Use endpoints with mixed case names
+        endpoints_with_mixed_case = [
+            {
+                "Id": 1,
+                "Name": "MainServer",
+                "Type": 1,
+                "URL": "unix:///var/run/docker.sock",
+            },
+            {
+                "Id": 2,
+                "Name": "BACKUP-HOST",
+                "Type": 1,
+                "URL": "tcp://192.168.1.100:2375",
+            },
+        ]
+        
+        # Mock endpoint fetch
+        mock_endpoint_response = MagicMock()
+        mock_endpoint_response.json.return_value = endpoints_with_mixed_case
+        
+        # Mock container fetch
+        mock_container_response = MagicMock()
+        mock_container_response.json.return_value = [
+            {
+                "Id": "abc123",
+                "Names": ["/container1"],
+                "Image": "nginx:latest",
+                "State": "running",
+                "Status": "Up 2 hours",
+                "RestartCount": 0,
+            }
+        ]
+        
+        def mock_get(url, timeout=None):
+            if "endpoints" in url and "docker" not in url:
+                return mock_endpoint_response
+            else:
+                return mock_container_response
+        
+        mocker.patch.object(exporter.session, "get", side_effect=mock_get)
+        
+        exporter.collect_all_metrics()
+        
+        assert len(exporter.metrics) == 2
+        for metric in exporter.metrics:
+            assert metric.hostname.islower(), f"Hostname '{metric.hostname}' is not lowercase"
+        assert exporter.metrics[0].hostname == "mainserver"
+        assert exporter.metrics[1].hostname == "backup-host"

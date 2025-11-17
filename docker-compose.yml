@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: container-status-exporter
+    ports:
+      - "8081:8081"
+    environment:
+      PORTAINER_URL: "http://host.docker.internal:9000"  # Use host.docker.internal for Docker Desktop
+      PORTAINER_TOKEN: "${PORTAINER_TOKEN}"  # Set via .env or -e flag
+      SCRAPE_INTERVAL: "30"
+      LISTEN_PORT: "8081"
+      LOG_LEVEL: "INFO"
+    restart: unless-stopped
+    # For Linux/Podman, you may need to adjust networking
+    # networks:
+    #   - default

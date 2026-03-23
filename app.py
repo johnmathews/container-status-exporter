@@ -6,16 +6,17 @@ Exports container state and health metrics from Portainer API
 to be scraped by Prometheus.
 """
 
+import logging
 import os
 import sys
 import time
-import logging
-import requests
-from typing import Any, cast
 from dataclasses import dataclass
 from enum import Enum
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
+from typing import Any, cast
+
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -46,6 +47,11 @@ class HealthStatus(Enum):
     STARTING = 3
 
 
+# Portainer endpoint status constants
+ENDPOINT_STATUS_UP = 1
+ENDPOINT_STATUS_DOWN = 2
+
+
 @dataclass
 class ContainerMetrics:
     """Dataclass to hold container metrics"""
@@ -58,13 +64,20 @@ class ContainerMetrics:
     restart_count: int
 
 
+@dataclass
+class EndpointStatus:
+    """Tracks the online/offline status of a Portainer endpoint"""
+
+    endpoint_id: int
+    hostname: str
+    online: bool
+
+
 class PortainerExporter:
     """Main exporter class for Portainer API"""
 
     def __init__(self) -> None:
-        self.portainer_url: str = os.getenv(
-            "PORTAINER_URL", "http://localhost:9000"
-        ).rstrip("/")
+        self.portainer_url: str = os.getenv("PORTAINER_URL", "http://localhost:9000").rstrip("/")
         self.portainer_token: str = os.getenv("PORTAINER_TOKEN", "")
         self.scrape_interval: int = int(os.getenv("SCRAPE_INTERVAL", "30"))
         self.listen_port: int = int(os.getenv("LISTEN_PORT", "8081"))
@@ -75,6 +88,7 @@ class PortainerExporter:
         self.session: requests.Session = requests.Session()
         self.session.headers.update({"X-API-Key": self.portainer_token})
         self.metrics: list[ContainerMetrics] = []
+        self.endpoint_statuses: list[EndpointStatus] = []
         self.last_error: str | None = None
         self.last_update: float = 0
 
@@ -129,16 +143,14 @@ class PortainerExporter:
 
             # Cast to proper type since we've validated it's a list
             endpoints: list[dict[str, Any]] = cast(list[dict[str, Any]], data)
-            logger.info(f"Found {len(endpoints)} endpoints")
+            logger.info(f"Fetched {len(endpoints)} endpoints from Portainer")
             return endpoints
         except requests.RequestException as e:
-            logger.error(f"Failed to fetch endpoints: {e}")
+            logger.error(f"Failed to fetch endpoints from Portainer at {self.portainer_url}: {e}")
             self.last_error = str(e)
             return []
 
-    def fetch_containers(
-        self, endpoint_id: int, hostname: str
-    ) -> list[ContainerMetrics]:
+    def fetch_containers(self, endpoint_id: int, hostname: str) -> list[ContainerMetrics]:
         """Fetch all containers from a specific endpoint"""
         containers: list[ContainerMetrics] = []
         try:
@@ -198,10 +210,18 @@ class PortainerExporter:
                 )
                 containers.append(metrics)
 
-            logger.info(f"Found {len(containers)} containers on {hostname}")
+            logger.info(f"Fetched {len(containers)} containers from endpoint '{hostname}'")
             return containers
+        except requests.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else None
+            if status_code in (502, 503):
+                logger.debug(f"Endpoint '{hostname}' is offline (HTTP {status_code}), skipping container fetch")
+            else:
+                logger.error(f"HTTP error fetching containers from endpoint '{hostname}': {e}")
+                self.last_error = str(e)
+            return []
         except requests.RequestException as e:
-            logger.error(f"Failed to fetch containers from {hostname}: {e}")
+            logger.error(f"Failed to fetch containers from endpoint '{hostname}': {e}")
             self.last_error = str(e)
             return []
 
@@ -209,26 +229,43 @@ class PortainerExporter:
         """Collect metrics from all endpoints and containers"""
         try:
             self.metrics = []
+            self.endpoint_statuses = []
             endpoints = self.fetch_endpoints()
+
+            online_count = 0
+            offline_count = 0
 
             for endpoint in endpoints:
                 endpoint_id_value: Any = endpoint.get("Id", 0)
-                endpoint_id: int = (
-                    endpoint_id_value if isinstance(endpoint_id_value, int) else 0
-                )
+                endpoint_id: int = endpoint_id_value if isinstance(endpoint_id_value, int) else 0
 
                 hostname_value: Any = endpoint.get("Name", "unknown")
-                hostname: str = (
-                    hostname_value if isinstance(hostname_value, str) else "unknown"
-                )
+                hostname: str = hostname_value if isinstance(hostname_value, str) else "unknown"
                 hostname = hostname.lower()
 
+                # Check endpoint status from Portainer (1=up, 2=down)
+                status_value: Any = endpoint.get("Status", ENDPOINT_STATUS_UP)
+                endpoint_online: bool = status_value == ENDPOINT_STATUS_UP
+
+                self.endpoint_statuses.append(
+                    EndpointStatus(endpoint_id=endpoint_id, hostname=hostname, online=endpoint_online)
+                )
+
+                if not endpoint_online:
+                    offline_count += 1
+                    logger.debug(f"Skipping offline endpoint '{hostname}' (id={endpoint_id})")
+                    continue
+
+                online_count += 1
                 containers = self.fetch_containers(endpoint_id, hostname)
                 self.metrics.extend(containers)
 
             self.last_update = time.time()
             self.last_error = None
-            logger.info(f"Successfully collected {len(self.metrics)} container metrics")
+            logger.info(
+                f"Collected {len(self.metrics)} container metrics "
+                f"from {online_count} online endpoints ({offline_count} offline, skipped)"
+            )
         except Exception as e:
             logger.error(f"Error collecting metrics: {e}")
             self.last_error = str(e)
@@ -239,7 +276,7 @@ class PortainerExporter:
 
         # Add HELP and TYPE comments
         output.append(
-            "# HELP container_state Container state (0=exited, 1=running, 2=paused, 3=created, 4=restarting, 5=dead, 6=unknown)"
+            "# HELP container_state Container state (0=exited, 1=running, 2=paused, 3=created, 4=restarting, 5=dead, 6=unknown)"  # noqa: E501
         )
         output.append("# TYPE container_state gauge")
 
@@ -248,9 +285,7 @@ class PortainerExporter:
             output.append(f"container_state{{{labels}}} {metric.state}")
 
         output.append("")
-        output.append(
-            "# HELP container_health Container health status (0=none, 1=healthy, 2=unhealthy, 3=starting)"
-        )
+        output.append("# HELP container_health Container health status (0=none, 1=healthy, 2=unhealthy, 3=starting)")
         output.append("# TYPE container_health gauge")
 
         for metric in self.metrics:
@@ -258,9 +293,7 @@ class PortainerExporter:
             output.append(f"container_health{{{labels}}} {metric.health}")
 
         output.append("")
-        output.append(
-            "# HELP container_restart_count Number of times the container has been restarted"
-        )
+        output.append("# HELP container_restart_count Number of times the container has been restarted")
         output.append("# TYPE container_restart_count gauge")
 
         for metric in self.metrics:
@@ -268,21 +301,22 @@ class PortainerExporter:
             output.append(f"container_restart_count{{{labels}}} {metric.restart_count}")
 
         output.append("")
-        output.append(
-            "# HELP portainer_exporter_up Whether the exporter is up and connected to Portainer"
-        )
+        output.append("# HELP portainer_endpoint_status Whether a Portainer endpoint is online (1) or offline (0)")
+        output.append("# TYPE portainer_endpoint_status gauge")
+
+        for ep in self.endpoint_statuses:
+            output.append(f'portainer_endpoint_status{{hostname="{ep.hostname}"}} {1 if ep.online else 0}')
+
+        output.append("")
+        output.append("# HELP portainer_exporter_up Whether the exporter is up and connected to Portainer")
         output.append("# TYPE portainer_exporter_up gauge")
         up_status: int = 1 if self.last_error is None else 0
         output.append(f"portainer_exporter_up {up_status}")
 
         output.append("")
-        output.append(
-            "# HELP portainer_exporter_last_scrape_timestamp Unix timestamp of last successful scrape"
-        )
+        output.append("# HELP portainer_exporter_last_scrape_timestamp Unix timestamp of last successful scrape")
         output.append("# TYPE portainer_exporter_last_scrape_timestamp gauge")
-        output.append(
-            f"portainer_exporter_last_scrape_timestamp {int(self.last_update)}"
-        )
+        output.append(f"portainer_exporter_last_scrape_timestamp {int(self.last_update)}")
 
         return "\n".join(output) + "\n"
 
@@ -307,9 +341,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
             import json
 
             if self.exporter is not None:
-                health = json.dumps(
-                    {"status": "up", "last_error": self.exporter.last_error}
-                )
+                health = json.dumps({"status": "up", "last_error": self.exporter.last_error})
                 _ = self.wfile.write(health.encode("utf-8"))
         else:
             self.send_response(404)
@@ -345,9 +377,7 @@ def main():
         exporter.collect_all_metrics()
 
         # Start background collection thread
-        logger.info(
-            f"Starting background collection every {exporter.scrape_interval} seconds"
-        )
+        logger.info(f"Starting background collection every {exporter.scrape_interval} seconds")
         _ = run_collector_thread(exporter, exporter.scrape_interval)
 
         # Start HTTP server

@@ -3,7 +3,14 @@ __pycache__
 .git
 .gitignore
 README.md
+CLAUDE.md
 docker-compose.yml
 .DS_Store
 .venv
-venv
+.engineering-team
+docs
+journal
+tests
+htmlcov
+.coverage
+.pytest_cache

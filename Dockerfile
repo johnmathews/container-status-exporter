@@ -1,10 +1,12 @@
 FROM python:3.11-slim
 
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 WORKDIR /app
 
 # Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
 
 # Copy application
 COPY app.py .
@@ -15,10 +17,10 @@ USER exporter
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8081/health', timeout=5)"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"
 
 # Expose metrics port
 EXPOSE 8081
 
 # Run the exporter
-CMD ["python", "app.py"]
+CMD ["uv", "run", "python", "app.py"]

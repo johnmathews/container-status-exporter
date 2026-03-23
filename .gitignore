@@ -34,3 +34,4 @@ venv.bak/
 .coverage
 htmlcov/
 .pytest_cache/
+.engineering-team/

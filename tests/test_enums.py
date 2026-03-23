@@ -2,7 +2,6 @@
 Tests for ContainerState and HealthStatus enums.
 """
 
-import pytest
 from app import ContainerState, HealthStatus
 
 

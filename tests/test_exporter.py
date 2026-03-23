@@ -2,9 +2,11 @@
 Tests for PortainerExporter class and helper functions.
 """
 
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
-from app import PortainerExporter, ContainerState, HealthStatus
+
+from app import ContainerState, HealthStatus, PortainerExporter
 
 
 class TestPortainerExporterInit:
@@ -191,7 +193,7 @@ class TestHostnameLowercase:
 
         # Pass uppercase hostname
         metrics = exporter.fetch_containers(1, "MyDockerHost")
-        
+
         assert len(metrics) == 1
         assert metrics[0].hostname == "mydockerhost"
 
@@ -211,7 +213,7 @@ class TestHostnameLowercase:
         mocker.patch.object(exporter.session, "get", return_value=mock_response)
 
         metrics = exporter.fetch_containers(1, "docker-host-1")
-        
+
         assert len(metrics) == 1
         assert metrics[0].hostname == "docker-host-1"
 
@@ -231,7 +233,7 @@ class TestHostnameLowercase:
         mocker.patch.object(exporter.session, "get", return_value=mock_response)
 
         metrics = exporter.fetch_containers(1, "DockerHost-01")
-        
+
         assert len(metrics) == 1
         assert metrics[0].hostname == "dockerhost-01"
 
@@ -267,7 +269,7 @@ class TestHostnameLowercase:
         mocker.patch.object(exporter.session, "get", return_value=mock_response)
 
         metrics = exporter.fetch_containers(1, "MyProd-Server")
-        
+
         assert len(metrics) == 3
         for metric in metrics:
             assert metric.hostname == "myprod-server"
@@ -276,7 +278,7 @@ class TestHostnameLowercase:
     def test_metrics_output_has_lowercase_hostnames(self, exporter):
         """Test that generated metrics output contains lowercase hostnames."""
         from app import ContainerMetrics
-        
+
         # Manually set metrics with mixed case hostnames
         exporter.metrics = [
             ContainerMetrics(
@@ -296,9 +298,9 @@ class TestHostnameLowercase:
                 restart_count=0,
             ),
         ]
-        
+
         output = exporter.generate_metrics_output()
-        
+
         # Check that output contains lowercase hostnames
         assert 'hostname="mydockerhost"' in output
         assert 'hostname="prod-server"' in output
@@ -323,11 +325,11 @@ class TestHostnameLowercase:
                 "URL": "tcp://192.168.1.100:2375",
             },
         ]
-        
+
         # Mock endpoint fetch
         mock_endpoint_response = MagicMock()
         mock_endpoint_response.json.return_value = endpoints_with_mixed_case
-        
+
         # Mock container fetch
         mock_container_response = MagicMock()
         mock_container_response.json.return_value = [
@@ -340,17 +342,17 @@ class TestHostnameLowercase:
                 "RestartCount": 0,
             }
         ]
-        
+
         def mock_get(url, timeout=None):
             if "endpoints" in url and "docker" not in url:
                 return mock_endpoint_response
             else:
                 return mock_container_response
-        
+
         mocker.patch.object(exporter.session, "get", side_effect=mock_get)
-        
+
         exporter.collect_all_metrics()
-        
+
         assert len(exporter.metrics) == 2
         for metric in exporter.metrics:
             assert metric.hostname.islower(), f"Hostname '{metric.hostname}' is not lowercase"

@@ -2,9 +2,11 @@
 Tests for Portainer API interactions.
 """
 
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
 import requests
+
 from app import PortainerExporter
 
 
@@ -56,11 +58,7 @@ class TestFetchEndpoints:
 
     def test_fetch_endpoints_timeout(self, exporter, mocker):
         """Test handling of timeout when fetching endpoints."""
-        mocker.patch.object(
-            exporter.session,
-            "get",
-            side_effect=requests.Timeout("Request timed out")
-        )
+        mocker.patch.object(exporter.session, "get", side_effect=requests.Timeout("Request timed out"))
 
         endpoints = exporter.fetch_endpoints()
 
@@ -138,14 +136,16 @@ class TestFetchContainers:
 
     def test_fetch_containers_removes_leading_slash(self, exporter, mocker):
         """Test that leading slashes are removed from container names."""
-        containers_with_slash = [{
-            "Id": "abc123",
-            "Names": ["/my-container"],
-            "Image": "image:latest",
-            "State": "running",
-            "Status": "Up 1 hour",
-            "RestartCount": 0,
-        }]
+        containers_with_slash = [
+            {
+                "Id": "abc123",
+                "Names": ["/my-container"],
+                "Image": "image:latest",
+                "State": "running",
+                "Status": "Up 1 hour",
+                "RestartCount": 0,
+            }
+        ]
         mock_response = MagicMock()
         mock_response.json.return_value = containers_with_slash
         mock_response.raise_for_status.return_value = None
@@ -176,8 +176,7 @@ class TestFetchContainers:
         exporter.fetch_containers(1, "docker-host-1")
 
         mock_get.assert_called_once_with(
-            "http://localhost:9000/api/endpoints/1/docker/containers/json?all=true",
-            timeout=10
+            "http://localhost:9000/api/endpoints/1/docker/containers/json?all=true", timeout=10
         )
 
 
@@ -196,10 +195,18 @@ class TestCollectAllMetrics:
         mocker.patch.object(exporter, "fetch_endpoints", return_value=sample_endpoints)
 
         # Mock fetch_containers
-        mocker.patch.object(exporter, "fetch_containers", return_value=[
-            mocker.MagicMock(name="web", hostname="docker-host-1", image="nginx", state=1, health=1, restart_count=0),
-            mocker.MagicMock(name="db", hostname="docker-host-1", image="postgres", state=1, health=2, restart_count=1),
-        ])
+        mocker.patch.object(
+            exporter,
+            "fetch_containers",
+            return_value=[
+                mocker.MagicMock(
+                    name="web", hostname="docker-host-1", image="nginx", state=1, health=1, restart_count=0
+                ),
+                mocker.MagicMock(
+                    name="db", hostname="docker-host-1", image="postgres", state=1, health=2, restart_count=1
+                ),
+            ],
+        )
 
         exporter.collect_all_metrics()
 

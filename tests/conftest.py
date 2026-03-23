@@ -3,8 +3,6 @@ Pytest configuration and shared fixtures for Container Status Exporter tests.
 """
 
 import pytest
-import os
-from unittest.mock import Mock, patch, MagicMock
 
 
 @pytest.fixture

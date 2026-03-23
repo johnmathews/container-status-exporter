@@ -2,8 +2,10 @@
 Tests for metrics generation and output format.
 """
 
-import pytest
 from unittest.mock import patch
+
+import pytest
+
 from app import PortainerExporter
 
 
@@ -73,8 +75,14 @@ class TestGenerateMetricsOutput:
         output = exporter_with_metrics.generate_metrics_output()
 
         # Check containers with different restart counts
-        assert 'container_restart_count{container_name="web-server",hostname="docker-host-1",image="nginx:latest"} 0' in output
-        assert 'container_restart_count{container_name="database",hostname="docker-host-1",image="postgres:15"} 3' in output
+        assert (
+            'container_restart_count{container_name="web-server",hostname="docker-host-1",image="nginx:latest"} 0'
+            in output
+        )
+        assert (
+            'container_restart_count{container_name="database",hostname="docker-host-1",image="postgres:15"} 3'
+            in output
+        )
 
     def test_exporter_up_metric_success(self, exporter_with_metrics):
         """Test exporter_up metric when no error."""

@@ -1,138 +1,71 @@
 # Container Status Exporter
 
-A Prometheus exporter that exports Docker container status (running, paused, exited, etc.) and health information from Portainer API.
+A Prometheus exporter that exports Docker container status and health metrics from the Portainer API.
 
 ## Features
 
-- Exports container state metrics: running, paused, exited, created, restarting, dead
-- Exports container health status: healthy, unhealthy, starting, none
-- Exports container restart count
+- Container state metrics: running, paused, exited, created, restarting, dead
+- Container health status: healthy, unhealthy, starting, none
+- Container restart count tracking
 - Multi-host support via Portainer API
+- Graceful handling of offline endpoints (skipped, not errored)
 - Prometheus-compatible text format output
 - Built-in health check endpoint
 
-## Metrics
-
-### Container State
-
-```text
-container_state{container_name="...", hostname="...", image="..."}
-```
-
-Values:
-
-- 0 = exited
-- 1 = running
-- 2 = paused
-- 3 = created
-- 4 = restarting
-- 5 = dead
-- 6 = unknown
-
-### Container Health
-
-```text
-container_health{container_name="...", hostname="...", image="..."}
-```
-
-Values:
-
-- 0 = none (no health check)
-- 1 = healthy
-- 2 = unhealthy
-- 3 = starting
-
-### Container Restart Count
-
-```
-container_restart_count{container_name="...", hostname="...", image="..."}
-```
-
-### Exporter Status
-
-```text
-portainer_exporter_up           # 1 if connected to Portainer, 0 if error
-portainer_exporter_last_scrape_timestamp  # Unix timestamp of last successful scrape
-```
-
-## Testing
-
-### Run All Tests
+## Quick Start
 
 ```bash
-pytest
+# Set your Portainer API token
+export PORTAINER_TOKEN="your-token-here"
+
+# Run with Docker Compose
+docker compose up -d
+
+# Check metrics
+curl http://localhost:8081/metrics
 ```
 
-### Run with Coverage Report
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORTAINER_URL` | `http://localhost:9000` | Portainer API base URL |
+| `PORTAINER_TOKEN` | (required) | Portainer API token |
+| `SCRAPE_INTERVAL` | `30` | Seconds between metric collections |
+| `LISTEN_PORT` | `8081` | HTTP server port |
+| `LOG_LEVEL` | `INFO` | Python logging level |
+
+## Development
+
+Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
-pytest --cov=app --cov-report=html --cov-report=term
-```
+# Run tests
+uv run pytest
 
-### Run Specific Test File
+# Run tests with coverage
+uv run pytest --cov=app --cov-report=term-missing
 
-```bash
-pytest tests/test_enums.py
-```
+# Lint
+uv run ruff check .
 
-### Run Specific Test
-
-```bash
-pytest tests/test_enums.py::TestContainerState::test_running_value
-```
-
-### Run Tests with Verbose Output
-
-```bash
-pytest -v
+# Format
+uv run ruff format .
 ```
 
 ### Test Structure
 
-- `tests/test_enums.py` - Enum value mappings
-- `tests/test_exporter.py` - PortainerExporter initialization and helpers
-- `tests/test_api.py` - Portainer API interactions (mocked)
-- `tests/test_metrics.py` - Metrics generation and output format
-- `tests/test_handlers.py` - HTTP request handlers
+- `tests/test_enums.py` — Enum value mappings
+- `tests/test_exporter.py` — PortainerExporter initialization and helpers
+- `tests/test_api.py` — Portainer API interactions (mocked)
+- `tests/test_metrics.py` — Metrics generation and output format
+- `tests/test_handlers.py` — HTTP request handlers
+- `tests/test_offline_endpoints.py` — Offline endpoint handling and error differentiation
 
-Coverage is currently **95%+** across the codebase.
+## Documentation
 
-## Requirements
-
-- Python 3.11+
-- Portainer API token
-- Network access to Portainer API
-- Prometheus scraping the /metrics endpoint
-
-## Troubleshooting
-
-### "PORTAINER_TOKEN environment variable is required"
-
-Make sure the PORTAINER_TOKEN environment variable is set.
-
-### "Failed to fetch endpoints"
-
-- Check PORTAINER_URL is correct and accessible
-- Verify PORTAINER_TOKEN is valid (regenerate if needed)
-- Check network connectivity
-
-### Metrics not updating
-
-- Check logs: `docker logs container-status-exporter`
-- Verify Portainer is accessible from the container
-- Check the /health endpoint for errors
-
-## Architecture
-
-```text
-Portainer API
-    ↓
-Container Status Exporter (Python)
-    ↓
-Prometheus (scrapes /metrics every 30s)
-    ↓
-Grafana (visualizes with State Timeline)
-```
+- [Architecture](docs/architecture.md) — How the exporter works, metrics reference, Portainer API usage
+- [Deployment](docs/deployment.md) — Docker, Prometheus, and troubleshooting
 
 ## License
 

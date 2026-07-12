@@ -1,14 +1,17 @@
 """Tests for the image freshness module."""
 
+import json
 import logging
 import threading
-from datetime import UTC
+import time as time_module
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 import requests
 
 from freshness import (
+    MAX_RESPONSE_BYTES,
     STATUS_ERROR,
     STATUS_LOCAL,
     STATUS_OK,
@@ -83,12 +86,28 @@ class TestParseRfc3339:
         assert parse_rfc3339("not-a-date") == 0.0
         assert parse_rfc3339("") == 0.0
 
+    def test_naive_timestamp_interpreted_as_utc(self, monkeypatch):
+        """A tz-less timestamp is registry data in UTC, never the exporter host's local time."""
+        monkeypatch.setenv("TZ", "America/New_York")  # UTC-4/-5: local != UTC year-round
+        time_module.tzset()
+        try:
+            expected = datetime(2026, 5, 30, 18, 54, 6, tzinfo=UTC).timestamp()
+            assert parse_rfc3339("2026-05-30T18:54:06") == expected
+        finally:
+            monkeypatch.undo()
+            time_module.tzset()
 
-def _response(mocker, status=200, headers=None, body=None):
+
+def _response(mocker, status=200, headers=None, body=None, raw=b""):
+    """Mock a requests.Response: `body` is the decoded JSON, `raw` overrides the wire bytes."""
     resp = mocker.MagicMock()
     resp.status_code = status
     resp.headers = headers or {}
     resp.json.return_value = body
+    payload = raw or (b"" if body is None else json.dumps(body).encode())
+    resp.iter_content.side_effect = lambda chunk_size=65536: (
+        payload[i : i + chunk_size] for i in range(0, len(payload), chunk_size)
+    )
     return resp
 
 
@@ -750,3 +769,174 @@ class TestRateLimitGracefulDegradation:
         assert collector.registry.session.request.call_count == 2
         sleep.assert_called_once()
         assert sleep.call_args[0][0] == pytest.approx(2, abs=0.5)
+
+
+def _wire_single_host(mocker, collector, containers, inspected):
+    def get_json(path: str) -> Any:
+        if path == "/api/endpoints":
+            return [{"Id": 1, "Name": "host-a", "Status": 1}]
+        if path.endswith("/docker/containers/json"):
+            return containers
+        if "/docker/images/" in path:
+            return inspected
+        raise AssertionError(f"unexpected path {path}")
+
+    mocker.patch.object(collector, "_get_json", side_effect=get_json)
+
+
+class TestBoundedResponseReads:
+    """Registry/Portainer bodies are read incrementally and capped, never slurped unbounded."""
+
+    TOKEN_CHALLENGE = 'Bearer realm="https://auth.docker.io/token",service="registry.docker.io"'
+
+    def test_oversized_streamed_manifest_raises_registry_error(self, mocker):
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        client.session.request.return_value = _response(mocker, 200, raw=b"x" * (MAX_RESPONSE_BYTES + 1))
+        with pytest.raises(RegistryError):
+            client.get_remote_metadata(parse_image_ref("nginx:latest"), "sha256:top")
+
+    def test_oversized_content_length_rejected_before_reading_body(self, mocker):
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        resp = _response(mocker, 200, headers={"Content-Length": str(MAX_RESPONSE_BYTES + 1)}, body={})
+        client.session.request.return_value = resp
+        with pytest.raises(RegistryError):
+            client.get_remote_metadata(parse_image_ref("nginx:latest"), "sha256:top")
+        resp.iter_content.assert_not_called()
+
+    def test_oversized_token_response_raises_registry_error(self, mocker):
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        client.session.request.return_value = _response(mocker, 401, {"WWW-Authenticate": self.TOKEN_CHALLENGE})
+        client.session.get.return_value = _response(mocker, 200, raw=b"x" * (MAX_RESPONSE_BYTES + 1))
+        with pytest.raises(RegistryError):
+            client.get_remote_digest(parse_image_ref("nginx:latest"))
+
+    def test_malformed_json_body_raises_registry_error(self, mocker):
+        """json.loads replaced response.json(): parse failures must still surface as RegistryError."""
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        client.session.request.return_value = _response(mocker, 200, raw=b"not json{")
+        with pytest.raises(RegistryError):
+            client.get_remote_metadata(parse_image_ref("nginx:latest"), "sha256:top")
+
+    def test_normal_size_response_unaffected(self, mocker):
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        manifest = {"config": {"digest": "sha256:cfg"}}
+        config = {"created": "2026-06-30T23:54:12Z", "config": {"Labels": {}}}
+        client.session.request.side_effect = [
+            _response(mocker, 200, body=manifest),
+            _response(mocker, 200, body=config),
+        ]
+        version, created = client.get_remote_metadata(parse_image_ref("nginx:latest"), "sha256:top")
+        assert version == ""
+        assert created > 0
+
+    def test_oversized_registry_body_yields_error_status_in_collect(self, mocker, monkeypatch):
+        """A hostile registry streaming an endless token body -> status=error, not OOM."""
+        collector = _collector(monkeypatch)
+        _wire_single_host(
+            mocker,
+            collector,
+            containers=[{"Names": ["/web"], "Image": "nginx:latest", "ImageID": "sha256:img"}],
+            inspected={"Created": "2026-01-01T00:00:00Z", "Config": {}, "RepoDigests": ["nginx@sha256:old"]},
+        )
+        collector.registry.session = mocker.MagicMock()
+        collector.registry.session.request.return_value = _response(
+            mocker, 401, {"WWW-Authenticate": self.TOKEN_CHALLENGE}
+        )
+        collector.registry.session.get.return_value = _response(mocker, 200, raw=b"x" * (MAX_RESPONSE_BYTES + 1))
+
+        collector.collect()
+        assert len(collector.results) == 1
+        assert collector.results[0].status == STATUS_ERROR
+
+    def test_oversized_portainer_response_raises_request_exception(self, mocker, monkeypatch):
+        """Portainer is semi-trusted, but the cap is free: oversize surfaces as the usual request failure."""
+        collector = _collector(monkeypatch)
+        collector.session = mocker.MagicMock()
+        collector.session.get.return_value = _response(mocker, 200, raw=b"x" * (MAX_RESPONSE_BYTES + 1))
+        with pytest.raises(requests.RequestException):
+            collector._get_json("/api/endpoints")
+
+    def test_normal_portainer_response_parsed(self, mocker, monkeypatch):
+        collector = _collector(monkeypatch)
+        collector.session = mocker.MagicMock()
+        collector.session.get.return_value = _response(mocker, 200, body=[{"Id": 1}])
+        assert collector._get_json("/api/endpoints") == [{"Id": 1}]
+
+
+class TestMetadataFetchedByDigest:
+    """get_remote_metadata must GET the digest it just compared, not re-resolve the movable tag."""
+
+    def test_manifest_requested_by_digest_not_tag(self, mocker):
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        manifest = {"config": {"digest": "sha256:cfg"}}
+        config = {"created": "2026-06-30T23:54:12Z", "config": {"Labels": {}}}
+        client.session.request.side_effect = [
+            _response(mocker, 200, body=manifest),
+            _response(mocker, 200, body=config),
+        ]
+
+        client.get_remote_metadata(parse_image_ref("jellyfin/jellyfin:latest"), "sha256:top")
+
+        first_url = client.session.request.call_args_list[0][0][1]
+        assert first_url == "https://registry-1.docker.io/v2/jellyfin/jellyfin/manifests/sha256:top"
+        assert "/manifests/latest" not in first_url
+
+
+class TestBareImageIdRefs:
+    """A container whose Image is a bare image ID names no repository: local, not a registry error."""
+
+    INSPECTED = {"Created": "2026-01-01T00:00:00Z", "Config": {}, "RepoDigests": ["nginx@sha256:old"]}
+
+    @pytest.mark.parametrize(
+        "image",
+        [
+            "sha256:" + "a" * 64,  # canonical image ID
+            "sha256:abc123",  # truncated sha256: form
+            "f" * 64,  # bare 64-hex ID without the sha256: prefix
+        ],
+    )
+    def test_bare_image_id_is_local_without_registry_call(self, mocker, monkeypatch, image):
+        collector = _collector(monkeypatch)
+        _wire_single_host(
+            mocker,
+            collector,
+            containers=[{"Names": ["/orphan"], "Image": image, "ImageID": "sha256:img"}],
+            inspected=self.INSPECTED,  # RepoDigests non-empty: detection must key off the ref shape
+        )
+        digest = mocker.patch.object(collector.registry, "get_remote_digest")
+
+        collector.collect()
+        assert len(collector.results) == 1
+        assert collector.results[0].status == STATUS_LOCAL
+        assert collector.results[0].outdated == 0
+        digest.assert_not_called()
+
+    def test_normal_image_still_checked_against_registry(self, mocker, monkeypatch):
+        collector = _collector(monkeypatch)
+        _wire_single_host(
+            mocker,
+            collector,
+            containers=[{"Names": ["/web"], "Image": "nginx:latest", "ImageID": "sha256:img"}],
+            inspected=self.INSPECTED,
+        )
+        digest = mocker.patch.object(collector.registry, "get_remote_digest", return_value="sha256:old")
+        mocker.patch.object(collector.registry, "get_remote_metadata", return_value=("", 0.0))
+
+        collector.collect()
+        assert collector.results[0].status == STATUS_OK
+        digest.assert_called_once()
+
+
+class TestCheckRemotePinnedLeak:
+    """collect() filters pinned refs before _check_remote; a leak must fail safe, not report pinned."""
+
+    def test_unparseable_ref_reaching_check_remote_is_error(self, monkeypatch):
+        collector = _collector(monkeypatch)
+        state = collector._check_remote("valkey/valkey:8@sha256:fea8", {})
+        assert state.status == STATUS_ERROR

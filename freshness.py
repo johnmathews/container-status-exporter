@@ -14,12 +14,13 @@ version/created metadata blobs are cached by digest (immutable), so a check
 cycle is cheap. The default interval is 6 hours.
 """
 
+import json
 import logging
 import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from threading import Thread
 from typing import Any, cast
 
@@ -50,6 +51,14 @@ STATUS_ERROR = "error"  # registry check failed (dead repo, network, auth)
 TOKEN_TTL_SECONDS = 60.0
 # Backoff before the single retry of a transient digest-HEAD failure
 HEAD_RETRY_BACKOFF_SECONDS = 2.0
+# Cap on any HTTP response body we read (manifests, token JSON, config blobs,
+# Portainer payloads). Real manifests/configs are tens of KiB; 4 MiB is generous
+# headroom while keeping a hostile or compromised server from OOMing the exporter.
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+# Portainer reports Status 1 for endpoints it can reach ("up"), 2 for down
+PORTAINER_ENDPOINT_UP = 1
+# Timeout for Portainer API calls (seconds); registry calls use REGISTRY_TIMEOUT
+PORTAINER_TIMEOUT_SECONDS = 10
 
 
 class RegistryError(Exception):
@@ -68,6 +77,16 @@ class ImageRef:
     repository: str  # e.g. library/nginx or immich-app/immich-server
     tag: str  # e.g. latest
     original: str  # the reference as docker reported it
+
+
+# A bare image ID (canonical `sha256:<hex>`, a truncated `sha256:` form, or a naked
+# 64-hex digest) names no repository at all, so there is nothing to ask a registry.
+_IMAGE_ID_RE = re.compile(r"^(sha256:[0-9a-fA-F]+|[0-9a-fA-F]{64})$")
+
+
+def is_image_id(image: str) -> bool:
+    """True when a container's Image field is a bare image ID rather than a repo reference."""
+    return bool(_IMAGE_ID_RE.match(image))
 
 
 def parse_image_ref(image: str) -> ImageRef | None:
@@ -110,7 +129,11 @@ def parse_rfc3339(value: str) -> float:
     try:
         # Trim sub-second precision beyond microseconds and normalize Z
         cleaned = re.sub(r"\.(\d{6})\d*", r".\1", value).replace("Z", "+00:00")
-        return datetime.fromisoformat(cleaned).timestamp()
+        parsed = datetime.fromisoformat(cleaned)
+        if parsed.tzinfo is None:
+            # Registry/docker timestamps are UTC; never interpret them in the host's local TZ
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.timestamp()
     except ValueError:
         logger.debug(f"Could not parse timestamp: {value}")
         return 0.0
@@ -124,6 +147,39 @@ def escape_label_value(value: str) -> str:
     healthy path.
     """
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _read_bounded(response: requests.Response, limit: int = MAX_RESPONSE_BYTES) -> bytes:
+    """
+    Read a (streamed) response body incrementally, capped at `limit` bytes.
+
+    An honest oversized Content-Length is rejected before reading anything;
+    otherwise the body is consumed in chunks and abandoned the moment it
+    exceeds the cap, so a hostile server cannot OOM the exporter. Raises
+    RegistryError when the cap is exceeded.
+    """
+    declared = response.headers.get("Content-Length", "")
+    if declared.isdigit() and int(declared) > limit:
+        response.close()
+        raise RegistryError(f"Response body too large: Content-Length {declared} exceeds {limit} bytes")
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_content(chunk_size=65536):
+        total += len(chunk)
+        if total > limit:
+            response.close()
+            raise RegistryError(f"Response body too large: exceeds {limit} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _read_json_bounded(response: requests.Response, limit: int = MAX_RESPONSE_BYTES) -> Any:
+    """Parse a JSON body read via _read_bounded; RegistryError on oversize or malformed JSON."""
+    body = _read_bounded(response, limit)
+    try:
+        return json.loads(body)
+    except ValueError as e:
+        raise RegistryError(f"Invalid JSON response: {e}") from e
 
 
 class RegistryClient:
@@ -149,11 +205,11 @@ class RegistryClient:
         if "service" in params:
             query["service"] = params["service"]
         try:
-            response = self.session.get(realm, params=query, timeout=self.timeout)
+            response = self.session.get(realm, params=query, timeout=self.timeout, stream=True)
             if response.status_code == 429:
                 raise RegistryRateLimited(f"Token fetch from {realm} -> HTTP 429 (rate limited)")
             response.raise_for_status()
-            data: dict[str, Any] = response.json()
+            data: dict[str, Any] = _read_json_bounded(response)
             token = data.get("token") or data.get("access_token")
             return cast(str | None, token)
         except requests.RequestException as e:
@@ -169,6 +225,8 @@ class RegistryClient:
         (the same single-retry semantics as the uncached dance). HTTP 429 raises
         RegistryRateLimited so callers can degrade instead of reporting errors.
         """
+        # https only, deliberately: plain-http registries (e.g. localhost:5000)
+        # are unsupported -- nothing in the fleet uses one.
         url = f"https://{ref.registry}/v2/{ref.repository}/{path}"
         headers = {"Accept": accept}
         key = (ref.registry, ref.repository)
@@ -177,7 +235,8 @@ class RegistryClient:
             headers["Authorization"] = f"Bearer {cached[0]}"
         else:
             self._token_cache.pop(key, None)
-        response = self.session.request(method, url, headers=headers, timeout=self.timeout)
+        # stream=True so callers read bodies through _read_bounded (HEADs have no body)
+        response = self.session.request(method, url, headers=headers, timeout=self.timeout, stream=True)
         if response.status_code == 401:
             self._token_cache.pop(key, None)  # cached token stale/revoked
             challenge = response.headers.get("WWW-Authenticate", "")
@@ -185,7 +244,7 @@ class RegistryClient:
             if token:
                 self._token_cache[key] = (token, time.time())
                 headers["Authorization"] = f"Bearer {token}"
-                response = self.session.request(method, url, headers=headers, timeout=self.timeout)
+                response = self.session.request(method, url, headers=headers, timeout=self.timeout, stream=True)
         if response.status_code == 429:
             raise RegistryRateLimited(f"{method} {url} -> HTTP 429 (rate limited)")
         if response.status_code != 200:
@@ -221,7 +280,9 @@ class RegistryClient:
         if digest in self._meta_cache:
             return self._meta_cache[digest]
 
-        manifest: dict[str, Any] = self._request("GET", ref, f"manifests/{ref.tag}", MANIFEST_ACCEPT).json()
+        # GET the digest we just compared, not the tag: a tag re-pushed between the
+        # HEAD and this GET would cache the wrong metadata under this digest forever.
+        manifest: dict[str, Any] = _read_json_bounded(self._request("GET", ref, f"manifests/{digest}", MANIFEST_ACCEPT))
 
         # Multi-arch index: descend into the manifest for our platform
         if "manifests" in manifest:
@@ -234,13 +295,15 @@ class RegistryClient:
                     break
             if not child_digest:
                 raise RegistryError(f"No {self.platform} manifest in index for {ref.original}")
-            manifest = self._request("GET", ref, f"manifests/{child_digest}", MANIFEST_ACCEPT).json()
+            manifest = _read_json_bounded(self._request("GET", ref, f"manifests/{child_digest}", MANIFEST_ACCEPT))
 
         config_digest = cast(str, cast(dict[str, Any], manifest.get("config", {})).get("digest", ""))
         if not config_digest:
             raise RegistryError(f"No config digest in manifest for {ref.original}")
 
-        config: dict[str, Any] = self._request("GET", ref, f"blobs/{config_digest}", "application/json").json()
+        config: dict[str, Any] = _read_json_bounded(
+            self._request("GET", ref, f"blobs/{config_digest}", "application/json")
+        )
         labels = cast(dict[str, str], cast(dict[str, Any], config.get("config", {})).get("Labels") or {})
         version = labels.get(VERSION_LABEL, "")
         created = parse_rfc3339(labels.get(CREATED_LABEL) or cast(str, config.get("created", "")))
@@ -303,9 +366,14 @@ class FreshnessCollector:
     # -- Portainer helpers ------------------------------------------------
 
     def _get_json(self, path: str) -> Any:
-        response = self.session.get(f"{self.portainer_url}{path}", timeout=10)
+        response = self.session.get(f"{self.portainer_url}{path}", timeout=PORTAINER_TIMEOUT_SECONDS, stream=True)
         response.raise_for_status()
-        return response.json()
+        try:
+            return _read_json_bounded(response)
+        except RegistryError as e:
+            # Portainer is semi-trusted, but the cap is free. Surface oversize/garbage
+            # as the request failure every _get_json caller already degrades on.
+            raise requests.RequestException(f"Portainer response for {path}: {e}") from e
 
     def _inspect_image(self, endpoint_id: int, image_id: str) -> dict[str, Any]:
         return cast(dict[str, Any], self._get_json(f"/api/endpoints/{endpoint_id}/docker/images/{image_id}/json"))
@@ -319,7 +387,10 @@ class FreshnessCollector:
 
         ref = parse_image_ref(image)
         if ref is None:
-            state = RemoteState(status=STATUS_PINNED)
+            # collect() filters digest-pinned refs before calling us; if one leaks
+            # through anyway, fail safe as an error rather than claim it is pinned.
+            logger.warning(f"Freshness: unparseable image reference reached _check_remote: {image}")
+            state = RemoteState(status=STATUS_ERROR)
         else:
             try:
                 digest = self.registry.get_remote_digest(ref)
@@ -370,7 +441,7 @@ class FreshnessCollector:
             if not isinstance(endpoint, dict):
                 logger.debug(f"Freshness: skipping malformed endpoint entry: {endpoint!r}")
                 continue
-            if endpoint.get("Status") != 1:  # 1=up per Portainer
+            if endpoint.get("Status") != PORTAINER_ENDPOINT_UP:
                 continue
             endpoint_id = cast(int, endpoint.get("Id", 0))
             hostname = cast(str, endpoint.get("Name", "unknown")).lower()
@@ -415,7 +486,9 @@ class FreshnessCollector:
                 if "@" in image:
                     status = STATUS_PINNED
                     remote = RemoteState(status=STATUS_PINNED)
-                elif not repo_digests:
+                elif is_image_id(image) or not repo_digests:
+                    # Bare image IDs name no repository; like locally-built
+                    # images there is nothing upstream to compare against.
                     status = STATUS_LOCAL
                     remote = RemoteState(status=STATUS_LOCAL)
                 else:

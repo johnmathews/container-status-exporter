@@ -1,6 +1,6 @@
-FROM python:3.11-slim
+FROM python:3.13-slim
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /uvx /bin/
 
 WORKDIR /app
 
@@ -22,5 +22,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 # Expose metrics port
 EXPOSE 8081
 
-# Run the exporter
-CMD ["uv", "run", "python", "app.py"]
+# Run the exporter directly from the build-time venv (no uv sync at startup)
+CMD ["/app/.venv/bin/python", "app.py"]

@@ -26,7 +26,7 @@ docker pull ghcr.io/johnmathews/container-status-exporter:latest
 docker compose -f /srv/infra/docker-compose.yml up -d --force-recreate container-health-exporter
 ```
 
-Rollback: `:latest` is the only moving tag, so roll back by re-pushing a previous commit to `main` (CI rebuilds) or by pinning the previous image digest in the compose file.
+Rollback: `:latest` is the only moving tag the deploy uses (CI also pushes a `:main` branch tag and per-commit sha tags), so roll back by re-pushing a previous commit to `main` (CI rebuilds) or by pinning the previous image digest in the compose file.
 
 ## 1.3 Configuration
 

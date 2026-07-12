@@ -198,3 +198,39 @@ class TestServerHardening:
         assert exc_info.value.code == 0
         server_cls.assert_called_once_with(("0.0.0.0", 8081), MetricsHandler)
         server.serve_forever.assert_called_once()
+
+
+class TestMalformedEndpointEntries:
+    """A malformed entry in the endpoints list must not kill the collector.
+
+    Mirrors the freshness thread's guards: non-dict entries are skipped and
+    the collector thread survives any exception raised by a cycle.
+    """
+
+    def test_non_dict_endpoint_entries_skipped(self, exporter):
+        """None / string / int entries are skipped; valid endpoints still collected."""
+        endpoints = [
+            None,
+            "junk",
+            42,
+            {"Id": 1, "Name": "docker-host-1", "Status": 1},
+        ]
+        with (
+            patch.object(exporter, "fetch_endpoints", return_value=endpoints),
+            patch.object(exporter, "fetch_containers", return_value=[]) as mock_fetch,
+        ):
+            exporter.collect_all_metrics()
+
+        assert exporter.last_error is None
+        assert [s.hostname for s in exporter.endpoint_statuses] == ["docker-host-1"]
+        mock_fetch.assert_called_once_with(1, "docker-host-1")
+
+    def test_collector_loop_survives_collect_exception(self, exporter, caplog):
+        """The thread-loop guard contains arbitrary exceptions from a cycle."""
+        with (
+            patch.object(exporter, "collect_all_metrics", side_effect=KeyError("surprise")),
+            caplog.at_level(logging.ERROR),
+        ):
+            app._collect_all_safely(exporter)
+
+        assert "surprise" in caplog.text

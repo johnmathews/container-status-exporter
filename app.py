@@ -250,6 +250,9 @@ class PortainerExporter:
         offline_count = 0
 
         for endpoint in endpoints:
+            if not isinstance(endpoint, dict):
+                logger.debug(f"Skipping malformed endpoint entry: {endpoint!r}")
+                continue
             endpoint_id_value: Any = endpoint.get("Id", 0)
             endpoint_id: int = endpoint_id_value if isinstance(endpoint_id_value, int) else 0
 
@@ -389,12 +392,20 @@ class MetricsHandler(BaseHTTPRequestHandler):
         pass
 
 
+def _collect_all_safely(exporter: PortainerExporter) -> None:
+    """Run one collection cycle, containing any exception so the thread survives."""
+    try:
+        exporter.collect_all_metrics()
+    except Exception:
+        logger.exception("Collection cycle failed; will retry next interval")
+
+
 def run_collector_thread(exporter: PortainerExporter, interval: int) -> Thread:
     """Run metrics collection in a background thread"""
 
     def collector() -> None:
         while True:
-            exporter.collect_all_metrics()
+            _collect_all_safely(exporter)
             time.sleep(interval)
 
     thread = Thread(target=collector, daemon=True)

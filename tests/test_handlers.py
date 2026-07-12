@@ -1,10 +1,9 @@
 """
 Tests for the HTTP boundary: the real server class serving real requests.
 
-These spin up the same server construction main() uses (HTTPServer with
-MetricsHandler; picks up ThreadingHTTPServer automatically if app.py ever
-switches) on an ephemeral port and hit it with urllib, pinning the actual
-wiring in MetricsHandler.do_GET — including that a single /metrics response
+These spin up the same server construction main() uses (ThreadingHTTPServer
+with MetricsHandler) on an ephemeral port and hit it with urllib, pinning the
+actual wiring in MetricsHandler.do_GET — including that a single /metrics response
 carries BOTH the container-state families and the freshness families.
 """
 
@@ -60,10 +59,8 @@ def server_url(wired_exporter, wired_freshness):
     MetricsHandler.exporter = wired_exporter
     MetricsHandler.freshness = wired_freshness
 
-    # Use whatever server class app.py itself uses (main() constructs
-    # HTTPServer today; a later unit may switch to ThreadingHTTPServer).
-    server_cls = getattr(app, "ThreadingHTTPServer", None) or app.HTTPServer
-    server = server_cls(("127.0.0.1", 0), MetricsHandler)
+    # Use the same server class main() constructs.
+    server = app.ThreadingHTTPServer(("127.0.0.1", 0), MetricsHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:

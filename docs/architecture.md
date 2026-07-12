@@ -32,12 +32,14 @@ Grafana (visualizes with State Timeline)
 |-------|--------|---------|
 | `PortainerExporter` | `app.py` | Core API client — fetches endpoints and containers, generates Prometheus output |
 | `ContainerMetrics` | `app.py` | Dataclass holding per-container metric values |
+| `EndpointStatus` | `app.py` | Dataclass backing `portainer_endpoint_status` (per-endpoint online/offline) |
 | `MetricsHandler` | `app.py` | HTTP request handler for `/metrics` and `/health` (appends freshness output) |
 | `ContainerState` | `app.py` | Enum mapping Docker states to numeric values |
 | `HealthStatus` | `app.py` | Enum mapping health statuses to numeric values |
 | `FreshnessCollector` | `freshness.py` | Joins Portainer's running-container view with registry state; renders freshness metrics |
 | `RegistryClient` | `freshness.py` | Anonymous OCI-distribution client — token dance, digest HEADs, metadata by digest |
 | `ImageRef` / `ImageFreshness` | `freshness.py` | Dataclasses: a parsed image reference / the per-container freshness result |
+| `RemoteState` | `freshness.py` | Dataclass caching the registry verdict per image within a cycle (incl. the rate-limited sentinel) |
 
 ## Metrics
 

@@ -1,9 +1,12 @@
 """Tests for the image freshness module."""
 
+import logging
+import threading
 from datetime import UTC
 from typing import Any
 
 import pytest
+import requests
 
 from freshness import (
     STATUS_ERROR,
@@ -16,8 +19,10 @@ from freshness import (
     ImageRef,
     RegistryClient,
     RegistryError,
+    _collect_safely,
     parse_image_ref,
     parse_rfc3339,
+    run_freshness_thread,
 )
 
 
@@ -261,6 +266,124 @@ class TestFreshnessCollector:
         collector.collect()
         assert collector.results == []
 
+    def test_paginated_endpoints_response(self, mocker, monkeypatch):
+        """Portainer may wrap endpoints in a paginated {"results": [...]} dict."""
+        collector = _collector(monkeypatch)
+
+        def get_json(path: str) -> Any:
+            if path == "/api/endpoints":
+                return {"results": [{"Id": 1, "Name": "host-a", "Status": 1}]}
+            if path.endswith("/docker/containers/json"):
+                return [{"Names": ["/web"], "Image": "nginx:latest", "ImageID": "sha256:img"}]
+            return {"Created": "2026-06-01T00:00:00Z", "Config": {}, "RepoDigests": ["nginx@sha256:same"]}
+
+        mocker.patch.object(collector, "_get_json", side_effect=get_json)
+        mocker.patch.object(collector.registry, "get_remote_digest", return_value="sha256:same")
+        mocker.patch.object(collector.registry, "get_remote_metadata", return_value=("1.27", 1780000000.0))
+
+        collector.collect()
+        assert len(collector.results) == 1
+        result = collector.results[0]
+        assert result.status == STATUS_OK
+        assert result.hostname == "host-a"
+
+    def test_non_list_endpoints_payload_yields_empty_results(self, mocker, monkeypatch):
+        """An unrecognized /api/endpoints payload must not raise, just produce no results."""
+        collector = _collector(monkeypatch)
+        mocker.patch.object(collector, "_get_json", return_value={"unexpected": True})
+        collector.collect()
+        assert collector.results == []
+
+    def test_malformed_endpoint_and_container_entries_skipped(self, mocker, monkeypatch):
+        """Non-dict junk in endpoint/container lists is skipped without killing the cycle."""
+        collector = _collector(monkeypatch)
+
+        def get_json(path: str) -> Any:
+            if path == "/api/endpoints":
+                return ["garbage", 42, None, {"Id": 1, "Name": "host-a", "Status": 1}]
+            if path.endswith("/docker/containers/json"):
+                return [None, "junk", 3.14, {"Names": ["/web"], "Image": "nginx:latest", "ImageID": "sha256:img"}]
+            return {"Created": "2026-06-01T00:00:00Z", "Config": {}, "RepoDigests": ["nginx@sha256:d"]}
+
+        mocker.patch.object(collector, "_get_json", side_effect=get_json)
+        mocker.patch.object(collector.registry, "get_remote_digest", return_value="sha256:d")
+        mocker.patch.object(collector.registry, "get_remote_metadata", return_value=("", 0.0))
+
+        collector.collect()
+        assert len(collector.results) == 1
+        assert collector.results[0].container_name == "web"
+        assert collector.results[0].status == STATUS_OK
+
+    def test_metadata_failure_does_not_mask_successful_digest_check(self, mocker, monkeypatch):
+        """A metadata blob timeout is decoration: the digest verdict must stand."""
+        collector = _collector(monkeypatch)
+        self._wire_portainer(
+            mocker,
+            collector,
+            containers=[{"Names": ["/web"], "Image": "nginx:latest", "ImageID": "sha256:img"}],
+            inspected={"Created": "2026-01-01T00:00:00Z", "Config": {}, "RepoDigests": ["nginx@sha256:old"]},
+        )
+        mocker.patch.object(collector.registry, "get_remote_digest", return_value="sha256:new")
+        mocker.patch.object(
+            collector.registry, "get_remote_metadata", side_effect=requests.Timeout("config blob timed out")
+        )
+
+        collector.collect()
+        result = collector.results[0]
+        assert result.status == STATUS_OUTDATED
+        assert result.outdated == 1
+        assert result.available_version == ""
+        assert result.available_created == 0.0
+
+    def test_inspect_failure_renders_error_status(self, mocker, monkeypatch):
+        """Image-inspect failure flows through collect() to a status="error" info metric."""
+        collector = _collector(monkeypatch)
+
+        def get_json(path: str) -> Any:
+            if path == "/api/endpoints":
+                return [{"Id": 1, "Name": "host-a", "Status": 1}]
+            if path.endswith("/docker/containers/json"):
+                return [{"Names": ["/web"], "Image": "nginx:latest", "ImageID": "sha256:img"}]
+            raise requests.RequestException("inspect failed")
+
+        mocker.patch.object(collector, "_get_json", side_effect=get_json)
+
+        collector.collect()
+        assert len(collector.results) == 1
+        assert collector.results[0].status == STATUS_ERROR
+        assert collector.results[0].outdated == 0
+
+        output = collector.generate_output()
+        assert (
+            'container_image_info{container_name="web",hostname="host-a",image="nginx:latest",'
+            'status="error",current_version="",available_version=""} 1'
+        ) in output
+
+    def test_endpoints_fetch_failure_keeps_previous_results(self, mocker, monkeypatch):
+        """A failed endpoints fetch aborts the cycle without wiping the last good results."""
+        collector = _collector(monkeypatch)
+        previous = [ImageFreshness("web", "host-a", "nginx:latest", STATUS_OK)]
+        collector.results = previous
+        mocker.patch.object(collector, "_get_json", side_effect=requests.ConnectionError("portainer down"))
+
+        collector.collect()
+        assert collector.results is previous
+
+    def test_containers_fetch_failure_skips_endpoint(self, mocker, monkeypatch):
+        """A failed containers fetch skips that endpoint, the cycle still completes."""
+        collector = _collector(monkeypatch)
+
+        def get_json(path: str) -> Any:
+            if path == "/api/endpoints":
+                return [{"Id": 1, "Name": "host-a", "Status": 1}]
+            raise requests.RequestException("docker socket gone")
+
+        mocker.patch.object(collector, "_get_json", side_effect=get_json)
+
+        collector.collect()
+        assert collector.results == []
+        assert collector.last_check > 0
+
     def test_remote_checked_once_per_image_across_hosts(self, mocker, monkeypatch):
         collector = _collector(monkeypatch)
 
@@ -343,6 +466,42 @@ class TestGenerateOutput:
             float(match.group(2))  # value must be a parseable number
             saw_sample = True
         assert saw_sample
+
+
+class TestFreshnessThreadResilience:
+    def test_collect_safely_swallows_and_logs_arbitrary_exception(self, mocker, monkeypatch, caplog):
+        """The loop body must survive any exception from collect() and log it with a traceback."""
+        collector = _collector(monkeypatch)
+        mocker.patch.object(collector, "collect", side_effect=KeyError("surprising JSON shape"))
+
+        with caplog.at_level(logging.ERROR, logger="freshness"):
+            _collect_safely(collector)  # must not raise
+
+        assert any(record.exc_info for record in caplog.records), "expected logger.exception with traceback"
+
+    def test_collect_safely_runs_collect_normally(self, mocker, monkeypatch):
+        collector = _collector(monkeypatch)
+        collect = mocker.patch.object(collector, "collect")
+        _collect_safely(collector)
+        collect.assert_called_once()
+
+    def test_thread_reaches_sleep_after_collect_exception(self, mocker, monkeypatch):
+        """The daemon thread must proceed to the interval sleep even when collect() blows up."""
+        collector = _collector(monkeypatch)
+        mocker.patch.object(collector, "collect", side_effect=RuntimeError("boom"))
+        slept = threading.Event()
+
+        def fake_sleep(seconds: float) -> None:
+            assert seconds == collector.check_interval
+            slept.set()
+            raise SystemExit  # end the otherwise-infinite loop; silently exits the thread
+
+        mocker.patch("freshness.time.sleep", side_effect=fake_sleep)
+
+        thread = run_freshness_thread(collector)
+        assert slept.wait(timeout=5), "thread died before reaching sleep: collect() exception escaped the loop guard"
+        thread.join(timeout=5)
+        assert not thread.is_alive()
 
 
 class TestParseChallengeEdgeCases:

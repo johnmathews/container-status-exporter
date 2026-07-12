@@ -272,7 +272,8 @@ class FreshnessCollector:
                 version, created = "", 0.0
                 try:
                     version, created = self.registry.get_remote_metadata(ref, digest)
-                except RegistryError as e:
+                except (RegistryError, requests.RequestException) as e:
+                    # Metadata is decoration; the digest comparison already succeeded
                     logger.debug(f"No remote metadata for {image}: {e}")
                 state = RemoteState(status=STATUS_OK, digest=digest, version=version, created=created)
             except (RegistryError, requests.RequestException) as e:
@@ -287,15 +288,26 @@ class FreshnessCollector:
     def collect(self) -> None:
         """One full freshness cycle across all online Portainer endpoints."""
         try:
-            endpoints = cast(list[dict[str, Any]], self._get_json("/api/endpoints"))
+            data: Any = self._get_json("/api/endpoints")
         except requests.RequestException as e:
             logger.error(f"Freshness: failed to fetch endpoints: {e}")
             return
+
+        # Handle both list and paginated responses (mirrors app.py's fetch_endpoints)
+        if isinstance(data, dict) and "results" in data:
+            data = data["results"]
+        if not isinstance(data, list):
+            logger.error(f"Freshness: unexpected /api/endpoints payload type: {type(data).__name__}")
+            data = []
+        endpoints = cast(list[Any], data)
 
         results: list[ImageFreshness] = []
         remote_cache: dict[str, RemoteState] = {}
 
         for endpoint in endpoints:
+            if not isinstance(endpoint, dict):
+                logger.debug(f"Freshness: skipping malformed endpoint entry: {endpoint!r}")
+                continue
             if endpoint.get("Status") != 1:  # 1=up per Portainer
                 continue
             endpoint_id = cast(int, endpoint.get("Id", 0))
@@ -303,7 +315,7 @@ class FreshnessCollector:
 
             try:
                 containers = cast(
-                    list[dict[str, Any]],
+                    list[Any],
                     self._get_json(f"/api/endpoints/{endpoint_id}/docker/containers/json"),
                 )
             except requests.RequestException as e:
@@ -312,6 +324,9 @@ class FreshnessCollector:
 
             inspect_cache: dict[str, dict[str, Any]] = {}
             for container in containers:
+                if not isinstance(container, dict):
+                    logger.debug(f"Freshness: skipping malformed container entry on '{hostname}': {container!r}")
+                    continue
                 names = cast(list[str], container.get("Names") or ["unknown"])
                 name = names[0].lstrip("/")
                 image = cast(str, container.get("Image", "unknown"))
@@ -370,11 +385,14 @@ class FreshnessCollector:
 
     def generate_output(self) -> str:
         """Render freshness metrics in Prometheus text format."""
+        # Snapshot shared state once: the freshness thread may replace these mid-render
+        results = self.results
+        last_check = self.last_check
         output: list[str] = []
 
         output.append("# HELP container_image_outdated Whether the registry serves a newer image for this tag (1=yes)")
         output.append("# TYPE container_image_outdated gauge")
-        for r in self.results:
+        for r in results:
             labels = f'container_name="{r.container_name}",hostname="{r.hostname}",image="{r.image}"'
             output.append(f"container_image_outdated{{{labels}}} {r.outdated}")
 
@@ -384,7 +402,7 @@ class FreshnessCollector:
             "(status: ok|outdated|local|pinned|error; versions from OCI labels where published)"
         )
         output.append("# TYPE container_image_info gauge")
-        for r in self.results:
+        for r in results:
             labels = (
                 f'container_name="{r.container_name}",hostname="{r.hostname}",image="{r.image}",'
                 f'status="{r.status}",current_version="{r.current_version}",'
@@ -395,7 +413,7 @@ class FreshnessCollector:
         output.append("")
         output.append("# HELP container_image_current_created_timestamp Build time of the running image (unix ts)")
         output.append("# TYPE container_image_current_created_timestamp gauge")
-        for r in self.results:
+        for r in results:
             if r.current_created:
                 labels = f'container_name="{r.container_name}",hostname="{r.hostname}",image="{r.image}"'
                 output.append(f"container_image_current_created_timestamp{{{labels}}} {int(r.current_created)}")
@@ -405,7 +423,7 @@ class FreshnessCollector:
             "# HELP container_image_available_created_timestamp Build time of the image the registry serves (unix ts)"
         )
         output.append("# TYPE container_image_available_created_timestamp gauge")
-        for r in self.results:
+        for r in results:
             if r.available_created:
                 labels = f'container_name="{r.container_name}",hostname="{r.hostname}",image="{r.image}"'
                 output.append(f"container_image_available_created_timestamp{{{labels}}} {int(r.available_created)}")
@@ -413,9 +431,17 @@ class FreshnessCollector:
         output.append("")
         output.append("# HELP container_image_freshness_last_check_timestamp Unix timestamp of last freshness cycle")
         output.append("# TYPE container_image_freshness_last_check_timestamp gauge")
-        output.append(f"container_image_freshness_last_check_timestamp {int(self.last_check)}")
+        output.append(f"container_image_freshness_last_check_timestamp {int(last_check)}")
 
         return "\n".join(output) + "\n"
+
+
+def _collect_safely(collector: FreshnessCollector) -> None:
+    """Run one freshness cycle, containing any exception so the daemon thread survives."""
+    try:
+        collector.collect()
+    except Exception:
+        logger.exception("Freshness cycle failed; will retry next interval")
 
 
 def run_freshness_thread(collector: FreshnessCollector) -> Thread:
@@ -423,7 +449,7 @@ def run_freshness_thread(collector: FreshnessCollector) -> Thread:
 
     def loop() -> None:
         while True:
-            collector.collect()
+            _collect_safely(collector)
             time.sleep(collector.check_interval)
 
     thread = Thread(target=loop, daemon=True)

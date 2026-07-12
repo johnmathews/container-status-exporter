@@ -34,4 +34,4 @@ was exactly this).
   per 6 hours.
 - The "single-file application" principle became "two small files" — the
   registry client is a genuinely separate concern with its own test surface
-  (24 new tests, 119 total).
+  (26 new tests, 119 total).

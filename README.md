@@ -51,7 +51,7 @@ Requires [uv](https://docs.astral.sh/uv/).
 uv run pytest
 
 # Run tests with coverage
-uv run pytest --cov=app --cov-report=term-missing
+uv run pytest --cov=app --cov=freshness --cov-report=term-missing
 
 # Lint
 uv run ruff check .
@@ -66,8 +66,12 @@ uv run ruff format .
 - `tests/test_exporter.py` — PortainerExporter initialization and helpers
 - `tests/test_api.py` — Portainer API interactions (mocked)
 - `tests/test_metrics.py` — Metrics generation and output format
-- `tests/test_handlers.py` — HTTP request handlers
+- `tests/test_handlers.py` — HTTP boundary: a real server on an ephemeral port serving `/metrics` (both metric families in one body), `/health`, and 404
 - `tests/test_offline_endpoints.py` — Offline endpoint handling and error differentiation
+- `tests/test_contract.py` — Contract lock: the frozen 11-family metric surface (names, label keys, HELP/TYPE) parsed from real exposition output
+- `tests/test_collect_errors.py` — Collector error semantics: truthful `portainer_exporter_up`, retained snapshots on outage, atomic publish
+- `tests/test_escaping.py` — Prometheus label-value escaping with hostile inputs
+- `tests/test_freshness.py` — Image freshness: reference parsing, registry client (token dance, 429 carry-forward, bounded reads), collection cycles
 
 ## Documentation
 

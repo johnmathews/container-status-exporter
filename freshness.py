@@ -107,6 +107,16 @@ def parse_rfc3339(value: str) -> float:
         return 0.0
 
 
+def escape_label_value(value: str) -> str:
+    r"""Escape a Prometheus label value per the text exposition format spec.
+
+    Backslash, double-quote and newline become \\, \" and \n. Clean values
+    pass through unchanged, so escaping is an identity transform for the
+    healthy path.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
 class RegistryClient:
     """Anonymous client for OCI-distribution registries."""
 
@@ -393,7 +403,10 @@ class FreshnessCollector:
         output.append("# HELP container_image_outdated Whether the registry serves a newer image for this tag (1=yes)")
         output.append("# TYPE container_image_outdated gauge")
         for r in results:
-            labels = f'container_name="{r.container_name}",hostname="{r.hostname}",image="{r.image}"'
+            labels = (
+                f'container_name="{escape_label_value(r.container_name)}",'
+                f'hostname="{escape_label_value(r.hostname)}",image="{escape_label_value(r.image)}"'
+            )
             output.append(f"container_image_outdated{{{labels}}} {r.outdated}")
 
         output.append("")
@@ -404,9 +417,11 @@ class FreshnessCollector:
         output.append("# TYPE container_image_info gauge")
         for r in results:
             labels = (
-                f'container_name="{r.container_name}",hostname="{r.hostname}",image="{r.image}",'
-                f'status="{r.status}",current_version="{r.current_version}",'
-                f'available_version="{r.available_version}"'
+                f'container_name="{escape_label_value(r.container_name)}",'
+                f'hostname="{escape_label_value(r.hostname)}",image="{escape_label_value(r.image)}",'
+                f'status="{escape_label_value(r.status)}",'
+                f'current_version="{escape_label_value(r.current_version)}",'
+                f'available_version="{escape_label_value(r.available_version)}"'
             )
             output.append(f"container_image_info{{{labels}}} 1")
 
@@ -415,7 +430,10 @@ class FreshnessCollector:
         output.append("# TYPE container_image_current_created_timestamp gauge")
         for r in results:
             if r.current_created:
-                labels = f'container_name="{r.container_name}",hostname="{r.hostname}",image="{r.image}"'
+                labels = (
+                    f'container_name="{escape_label_value(r.container_name)}",'
+                    f'hostname="{escape_label_value(r.hostname)}",image="{escape_label_value(r.image)}"'
+                )
                 output.append(f"container_image_current_created_timestamp{{{labels}}} {int(r.current_created)}")
 
         output.append("")
@@ -425,7 +443,10 @@ class FreshnessCollector:
         output.append("# TYPE container_image_available_created_timestamp gauge")
         for r in results:
             if r.available_created:
-                labels = f'container_name="{r.container_name}",hostname="{r.hostname}",image="{r.image}"'
+                labels = (
+                    f'container_name="{escape_label_value(r.container_name)}",'
+                    f'hostname="{escape_label_value(r.hostname)}",image="{escape_label_value(r.image)}"'
+                )
                 output.append(f"container_image_available_created_timestamp{{{labels}}} {int(r.available_created)}")
 
         output.append("")

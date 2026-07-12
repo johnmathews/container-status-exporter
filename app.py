@@ -19,7 +19,7 @@ from typing import Any, cast
 
 import requests
 
-from freshness import FreshnessCollector, run_freshness_thread
+from freshness import FreshnessCollector, escape_label_value, run_freshness_thread
 
 # Configure logging
 logging.basicConfig(
@@ -300,7 +300,11 @@ class PortainerExporter:
         output.append("# TYPE container_state gauge")
 
         for metric in metrics:
-            labels: str = f'container_name="{metric.name}",hostname="{metric.hostname.lower()}",image="{metric.image}"'
+            labels: str = (
+                f'container_name="{escape_label_value(metric.name)}",'
+                f'hostname="{escape_label_value(metric.hostname.lower())}",'
+                f'image="{escape_label_value(metric.image)}"'
+            )
             output.append(f"container_state{{{labels}}} {metric.state}")
 
         output.append("")
@@ -308,7 +312,11 @@ class PortainerExporter:
         output.append("# TYPE container_health gauge")
 
         for metric in metrics:
-            labels = f'container_name="{metric.name}",hostname="{metric.hostname.lower()}",image="{metric.image}"'
+            labels = (
+                f'container_name="{escape_label_value(metric.name)}",'
+                f'hostname="{escape_label_value(metric.hostname.lower())}",'
+                f'image="{escape_label_value(metric.image)}"'
+            )
             output.append(f"container_health{{{labels}}} {metric.health}")
 
         output.append("")
@@ -316,7 +324,11 @@ class PortainerExporter:
         output.append("# TYPE container_restart_count gauge")
 
         for metric in metrics:
-            labels = f'container_name="{metric.name}",hostname="{metric.hostname.lower()}",image="{metric.image}"'
+            labels = (
+                f'container_name="{escape_label_value(metric.name)}",'
+                f'hostname="{escape_label_value(metric.hostname.lower())}",'
+                f'image="{escape_label_value(metric.image)}"'
+            )
             output.append(f"container_restart_count{{{labels}}} {metric.restart_count}")
 
         output.append("")
@@ -324,7 +336,9 @@ class PortainerExporter:
         output.append("# TYPE portainer_endpoint_status gauge")
 
         for ep in endpoint_statuses:
-            output.append(f'portainer_endpoint_status{{hostname="{ep.hostname}"}} {1 if ep.online else 0}')
+            output.append(
+                f'portainer_endpoint_status{{hostname="{escape_label_value(ep.hostname)}"}} {1 if ep.online else 0}'
+            )
 
         output.append("")
         output.append("# HELP portainer_exporter_up Whether the exporter is up and connected to Portainer")

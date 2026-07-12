@@ -234,9 +234,7 @@ class TestFreshnessCollector:
         self._wire_portainer(
             mocker,
             collector,
-            containers=[
-                {"Names": ["/redis"], "Image": "valkey/valkey:8@sha256:fea8", "ImageID": "sha256:img"}
-            ],
+            containers=[{"Names": ["/redis"], "Image": "valkey/valkey:8@sha256:fea8", "ImageID": "sha256:img"}],
             inspected={"Created": "2026-01-01T00:00:00Z", "Config": {}, "RepoDigests": ["valkey/valkey@sha256:fea8"]},
         )
         collector.collect()
@@ -313,10 +311,38 @@ class TestGenerateOutput:
         assert 'container_image_current_created_timestamp{container_name="jf"' not in output
 
     def test_output_is_valid_prometheus_exposition(self, monkeypatch):
+        import re
+
         collector = _collector(monkeypatch)
-        collector.results = [ImageFreshness("a", "b", "c:1", STATUS_OK)]
+        collector.results = [
+            ImageFreshness(
+                container_name="web",
+                hostname="host-a",
+                image="nginx:latest",
+                status=STATUS_OUTDATED,
+                current_version="1.27",
+                available_version="1.28",
+                current_created=1700000000.0,
+                available_created=1780000000.0,
+            ),
+            ImageFreshness("a", "b", "c:1", STATUS_OK),
+        ]
+        collector.last_check = 1780000123.0
+
+        label = r'[a-zA-Z_][a-zA-Z0-9_]*="[^"]*"'
+        sample_re = re.compile(rf"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{{{label}(?:,{label})*\}})? (\S+)$")
+        saw_sample = False
         for line in collector.generate_output().strip().split("\n"):
-            assert line.startswith("#") or line == "" or " " in line
+            if not line:
+                continue
+            if line.startswith("#"):
+                assert re.match(r"^# (HELP|TYPE) [a-zA-Z_:][a-zA-Z0-9_:]* \S", line), f"Invalid comment line: {line!r}"
+                continue
+            match = sample_re.match(line)
+            assert match, f"Invalid sample line: {line!r}"
+            float(match.group(2))  # value must be a parseable number
+            saw_sample = True
+        assert saw_sample
 
 
 class TestParseChallengeEdgeCases:

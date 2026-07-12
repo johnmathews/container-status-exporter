@@ -1,88 +1,132 @@
 """
-Tests for HTTP request handlers.
+Tests for the HTTP boundary: the real server class serving real requests.
+
+These spin up the same server construction main() uses (HTTPServer with
+MetricsHandler; picks up ThreadingHTTPServer automatically if app.py ever
+switches) on an ephemeral port and hit it with urllib, pinning the actual
+wiring in MetricsHandler.do_GET — including that a single /metrics response
+carries BOTH the container-state families and the freshness families.
 """
 
 import json
+import threading
+import urllib.error
+import urllib.request
 from unittest.mock import patch
 
 import pytest
 
-from app import MetricsHandler, PortainerExporter
+import app
+from app import EndpointStatus, MetricsHandler, PortainerExporter
+from freshness import STATUS_OUTDATED, FreshnessCollector, ImageFreshness
 
 
-class TestMetricsHandlerLogic:
-    """Test MetricsHandler logic without full HTTP request setup."""
+@pytest.fixture
+def wired_exporter(mock_env, sample_container_metrics) -> PortainerExporter:
+    with patch.dict("os.environ", mock_env):
+        exporter = PortainerExporter()
+    exporter.metrics = sample_container_metrics
+    exporter.endpoint_statuses = [EndpointStatus(endpoint_id=1, hostname="docker-host-1", online=True)]
+    exporter.last_update = 1234567890
+    exporter.last_error = None
+    return exporter
 
-    @pytest.fixture
-    def mock_exporter(self, mock_env, sample_container_metrics):
-        """Create a mock exporter with metrics."""
-        with patch.dict("os.environ", mock_env):
-            exporter = PortainerExporter()
-            exporter.metrics = sample_container_metrics
-            exporter.last_update = 1234567890
-            exporter.last_error = None
-            return exporter
 
-    def test_handler_generates_metrics_output(self, mock_exporter):
-        """Test that handler can generate metrics output."""
-        MetricsHandler.exporter = mock_exporter
+@pytest.fixture
+def wired_freshness(mock_env) -> FreshnessCollector:
+    with patch.dict("os.environ", mock_env):
+        collector = FreshnessCollector()
+    collector.results = [
+        ImageFreshness(
+            container_name="web-server",
+            hostname="docker-host-1",
+            image="nginx:latest",
+            status=STATUS_OUTDATED,
+            current_version="1.27",
+            available_version="1.28",
+            current_created=1700000000.0,
+            available_created=1780000000.0,
+        ),
+    ]
+    collector.last_check = 1780000123.0
+    return collector
 
-        output = mock_exporter.generate_metrics_output()
 
-        assert "container_state" in output
-        assert "container_health" in output
-        assert "container_restart_count" in output
+@pytest.fixture
+def server_url(wired_exporter, wired_freshness):
+    """Run the app's real HTTP server on an ephemeral port, wired to fixture data."""
+    previous_exporter = MetricsHandler.exporter
+    previous_freshness = MetricsHandler.freshness
+    MetricsHandler.exporter = wired_exporter
+    MetricsHandler.freshness = wired_freshness
 
-    def test_handler_generates_health_json(self, mock_exporter):
-        """Test that handler can generate health JSON."""
-        MetricsHandler.exporter = mock_exporter
-        mock_exporter.last_error = None
+    # Use whatever server class app.py itself uses (main() constructs
+    # HTTPServer today; a later unit may switch to ThreadingHTTPServer).
+    server_cls = getattr(app, "ThreadingHTTPServer", None) or app.HTTPServer
+    server = server_cls(("127.0.0.1", 0), MetricsHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        MetricsHandler.exporter = previous_exporter
+        MetricsHandler.freshness = previous_freshness
 
-        health_data = {"status": "up", "last_error": mock_exporter.last_error}
 
-        json_output = json.dumps(health_data)
-        parsed = json.loads(json_output)
+def _get(url: str) -> tuple[int, str, str]:
+    """GET a URL; return (status, content_type, body)."""
+    with urllib.request.urlopen(url, timeout=5) as response:
+        return response.status, response.headers.get("Content-Type", ""), response.read().decode("utf-8")
 
-        assert parsed["status"] == "up"
-        assert parsed["last_error"] is None
 
-    def test_health_json_with_error(self, mock_exporter):
-        """Test health JSON includes error when present."""
-        mock_exporter.last_error = "Connection failed"
+class TestHTTPBoundary:
+    def test_metrics_returns_200_text_plain(self, server_url):
+        status, content_type, _ = _get(f"{server_url}/metrics")
+        assert status == 200
+        assert content_type.startswith("text/plain")
 
-        health_data = {"status": "up", "last_error": mock_exporter.last_error}
+    def test_metrics_response_contains_app_and_freshness_families(self, server_url):
+        """One /metrics response must carry BOTH modules' metrics (do_GET wiring)."""
+        _, _, body = _get(f"{server_url}/metrics")
+        lines = body.split("\n")
+        # app.py families
+        assert any(line.startswith("container_state{") for line in lines)
+        assert "portainer_exporter_up 1" in lines
+        # freshness.py families, appended by do_GET
+        assert any(line.startswith("container_image_outdated{") for line in lines)
+        assert any(line.startswith("container_image_freshness_last_check_timestamp ") for line in lines)
 
-        json_output = json.dumps(health_data)
-        parsed = json.loads(json_output)
+    def test_metrics_sample_values_come_from_wired_collectors(self, server_url):
+        _, _, body = _get(f"{server_url}/metrics")
+        assert 'container_state{container_name="web-server",hostname="docker-host-1",image="nginx:latest"} 1' in body
+        assert (
+            'container_image_outdated{container_name="web-server",hostname="docker-host-1",image="nginx:latest"} 1'
+            in body
+        )
 
-        assert parsed["last_error"] == "Connection failed"
+    def test_health_returns_200_json_with_real_shape(self, server_url):
+        status, content_type, body = _get(f"{server_url}/health")
+        assert status == 200
+        assert content_type.startswith("application/json")
+        payload = json.loads(body)
+        assert set(payload) == {"status", "last_error"}
+        assert payload["status"] == "up"
+        assert payload["last_error"] is None
 
-    def test_log_message_method_exists(self, mock_exporter):
-        """Test that log_message method exists and is callable."""
-        MetricsHandler.exporter = mock_exporter
+    def test_health_reports_last_error(self, server_url, wired_exporter):
+        wired_exporter.last_error = "Connection failed"
+        _, _, body = _get(f"{server_url}/health")
+        assert json.loads(body)["last_error"] == "Connection failed"
 
-        # Create a minimal handler instance (without full HTTP setup)
+    def test_unknown_path_returns_404(self, server_url):
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _get(f"{server_url}/nope")
+        assert exc_info.value.code == 404
+
+    def test_log_message_is_suppressed(self):
+        """log_message is overridden to a no-op so scrapes don't spam stderr."""
         handler = MetricsHandler.__new__(MetricsHandler)
-
-        # log_message should be a no-op
-        result = handler.log_message("test format", "arg1", "arg2")
-        assert result is None
-
-    def test_path_routing_logic(self, mock_exporter):
-        """Test path routing logic for different endpoints."""
-        MetricsHandler.exporter = mock_exporter
-
-        # Test paths
-        paths = {
-            "/metrics": True,
-            "/health": True,
-            "/unknown": False,
-            "/": False,
-            "/api/metrics": False,
-        }
-
-        for path, should_exist in paths.items():
-            if path == "/metrics" or path == "/health":
-                assert should_exist, f"Path {path} should be routable"
-            else:
-                assert not should_exist, f"Path {path} should return 404"
+        assert handler.log_message("test format %s %s", "arg1", "arg2") is None

@@ -121,17 +121,25 @@ class TestGenerateMetricsOutput:
         assert output.endswith("\n")
 
     def test_prometheus_format_compliance(self, exporter_with_metrics):
-        """Test output follows Prometheus text format."""
-        output = exporter_with_metrics.generate_metrics_output()
-        lines = output.strip().split("\n")
+        """Every non-comment line must parse as `name{label="v",...} <number>` or `name <number>`."""
+        import re
 
-        for line in lines:
+        output = exporter_with_metrics.generate_metrics_output()
+
+        label = r'[a-zA-Z_][a-zA-Z0-9_]*="[^"]*"'
+        sample_re = re.compile(rf"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{{{label}(?:,{label})*\}})? (\S+)$")
+        saw_sample = False
+        for line in output.strip().split("\n"):
+            if not line:
+                continue
             if line.startswith("#"):
-                # Comments should start with #
-                assert line.startswith("# HELP") or line.startswith("# TYPE")
-            elif line:
-                # Metrics should have metric_name{labels} value format
-                assert "{" in line or line.split()[0] != ""
+                assert re.match(r"^# (HELP|TYPE) [a-zA-Z_:][a-zA-Z0-9_:]* \S", line), f"Invalid comment line: {line!r}"
+                continue
+            match = sample_re.match(line)
+            assert match, f"Invalid sample line: {line!r}"
+            float(match.group(2))  # value must be a parseable number
+            saw_sample = True
+        assert saw_sample
 
     def test_metric_name_consistency(self, exporter_with_metrics):
         """Test that all metric names are consistent."""

@@ -6,13 +6,14 @@ Exports container state and health metrics from Portainer API
 to be scraped by Prometheus.
 """
 
+import json
 import logging
 import os
 import sys
 import time
 from dataclasses import dataclass
 from enum import Enum
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from typing import Any, cast
 
@@ -128,29 +129,28 @@ class PortainerExporter:
         return "none"
 
     def fetch_endpoints(self) -> list[dict[str, Any]]:
-        """Fetch all endpoints (Docker hosts) from Portainer"""
-        try:
-            url = f"{self.portainer_url}/api/endpoints"
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            data: Any = response.json()
+        """Fetch all endpoints (Docker hosts) from Portainer.
 
-            # Handle both list and paginated responses
-            if isinstance(data, dict) and "results" in data:
-                data = data["results"]
+        Raises requests.RequestException on failure so collect_all_metrics can
+        distinguish "Portainer unreachable" from "legitimately zero endpoints".
+        """
+        url = f"{self.portainer_url}/api/endpoints"
+        response = self.session.get(url, timeout=10)
+        response.raise_for_status()
+        data: Any = response.json()
 
-            # Type guard to ensure we have a list
-            if not isinstance(data, list):
-                return []
+        # Handle both list and paginated responses
+        if isinstance(data, dict) and "results" in data:
+            data = data["results"]
 
-            # Cast to proper type since we've validated it's a list
-            endpoints: list[dict[str, Any]] = cast(list[dict[str, Any]], data)
-            logger.info(f"Fetched {len(endpoints)} endpoints from Portainer")
-            return endpoints
-        except requests.RequestException as e:
-            logger.error(f"Failed to fetch endpoints from Portainer at {self.portainer_url}: {e}")
-            self.last_error = str(e)
+        # Type guard to ensure we have a list
+        if not isinstance(data, list):
             return []
+
+        # Cast to proper type since we've validated it's a list
+        endpoints: list[dict[str, Any]] = cast(list[dict[str, Any]], data)
+        logger.info(f"Fetched {len(endpoints)} endpoints from Portainer")
+        return endpoints
 
     def fetch_containers(self, endpoint_id: int, hostname: str) -> list[ContainerMetrics]:
         """Fetch all containers from a specific endpoint"""
@@ -219,61 +219,78 @@ class PortainerExporter:
             if status_code in (502, 503):
                 logger.debug(f"Endpoint '{hostname}' is offline (HTTP {status_code}), skipping container fetch")
             else:
+                # Per-endpoint failure: log it, but do NOT set last_error —
+                # a single flaky endpoint must not flip portainer_exporter_up
+                # to 0 fleet-wide.
                 logger.error(f"HTTP error fetching containers from endpoint '{hostname}': {e}")
-                self.last_error = str(e)
             return []
         except requests.RequestException as e:
             logger.error(f"Failed to fetch containers from endpoint '{hostname}': {e}")
-            self.last_error = str(e)
             return []
 
     def collect_all_metrics(self) -> None:
-        """Collect metrics from all endpoints and containers"""
+        """Collect metrics from all endpoints and containers.
+
+        Builds the new snapshot into local lists and publishes it by a single
+        reference assignment, so a concurrent scrape never observes a cleared
+        or partially-built list. If the endpoints fetch itself fails, the
+        previous snapshot is kept, last_error is set (portainer_exporter_up
+        renders 0), and last_update does not advance.
+        """
         try:
-            self.metrics = []
-            self.endpoint_statuses = []
             endpoints = self.fetch_endpoints()
-
-            online_count = 0
-            offline_count = 0
-
-            for endpoint in endpoints:
-                endpoint_id_value: Any = endpoint.get("Id", 0)
-                endpoint_id: int = endpoint_id_value if isinstance(endpoint_id_value, int) else 0
-
-                hostname_value: Any = endpoint.get("Name", "unknown")
-                hostname: str = hostname_value if isinstance(hostname_value, str) else "unknown"
-                hostname = hostname.lower()
-
-                # Check endpoint status from Portainer (1=up, 2=down)
-                status_value: Any = endpoint.get("Status", ENDPOINT_STATUS_UP)
-                endpoint_online: bool = status_value == ENDPOINT_STATUS_UP
-
-                self.endpoint_statuses.append(
-                    EndpointStatus(endpoint_id=endpoint_id, hostname=hostname, online=endpoint_online)
-                )
-
-                if not endpoint_online:
-                    offline_count += 1
-                    logger.debug(f"Skipping offline endpoint '{hostname}' (id={endpoint_id})")
-                    continue
-
-                online_count += 1
-                containers = self.fetch_containers(endpoint_id, hostname)
-                self.metrics.extend(containers)
-
-            self.last_update = time.time()
-            self.last_error = None
-            logger.info(
-                f"Collected {len(self.metrics)} container metrics "
-                f"from {online_count} online endpoints ({offline_count} offline, skipped)"
-            )
         except Exception as e:
-            logger.error(f"Error collecting metrics: {e}")
+            logger.error(f"Failed to fetch endpoints from Portainer at {self.portainer_url}: {e}")
             self.last_error = str(e)
+            return
+
+        new_metrics: list[ContainerMetrics] = []
+        new_statuses: list[EndpointStatus] = []
+        online_count = 0
+        offline_count = 0
+
+        for endpoint in endpoints:
+            endpoint_id_value: Any = endpoint.get("Id", 0)
+            endpoint_id: int = endpoint_id_value if isinstance(endpoint_id_value, int) else 0
+
+            hostname_value: Any = endpoint.get("Name", "unknown")
+            hostname: str = hostname_value if isinstance(hostname_value, str) else "unknown"
+            hostname = hostname.lower()
+
+            # Check endpoint status from Portainer (1=up, 2=down)
+            status_value: Any = endpoint.get("Status", ENDPOINT_STATUS_UP)
+            endpoint_online: bool = status_value == ENDPOINT_STATUS_UP
+
+            new_statuses.append(EndpointStatus(endpoint_id=endpoint_id, hostname=hostname, online=endpoint_online))
+
+            if not endpoint_online:
+                offline_count += 1
+                logger.debug(f"Skipping offline endpoint '{hostname}' (id={endpoint_id})")
+                continue
+
+            online_count += 1
+            containers = self.fetch_containers(endpoint_id, hostname)
+            new_metrics.extend(containers)
+
+        # Atomic publish: swap in the complete snapshot in one assignment each.
+        self.metrics = new_metrics
+        self.endpoint_statuses = new_statuses
+        self.last_update = time.time()
+        self.last_error = None
+        logger.info(
+            f"Collected {len(new_metrics)} container metrics "
+            f"from {online_count} online endpoints ({offline_count} offline, skipped)"
+        )
 
     def generate_metrics_output(self) -> str:
         """Generate Prometheus metrics in text format"""
+        # Snapshot shared state once so a concurrent collect cannot cause a
+        # torn read while we iterate (collect publishes by reference swap).
+        metrics = self.metrics
+        endpoint_statuses = self.endpoint_statuses
+        last_error = self.last_error
+        last_update = self.last_update
+
         output: list[str] = []
 
         # Add HELP and TYPE comments
@@ -282,7 +299,7 @@ class PortainerExporter:
         )
         output.append("# TYPE container_state gauge")
 
-        for metric in self.metrics:
+        for metric in metrics:
             labels: str = f'container_name="{metric.name}",hostname="{metric.hostname.lower()}",image="{metric.image}"'
             output.append(f"container_state{{{labels}}} {metric.state}")
 
@@ -290,7 +307,7 @@ class PortainerExporter:
         output.append("# HELP container_health Container health status (0=none, 1=healthy, 2=unhealthy, 3=starting)")
         output.append("# TYPE container_health gauge")
 
-        for metric in self.metrics:
+        for metric in metrics:
             labels = f'container_name="{metric.name}",hostname="{metric.hostname.lower()}",image="{metric.image}"'
             output.append(f"container_health{{{labels}}} {metric.health}")
 
@@ -298,7 +315,7 @@ class PortainerExporter:
         output.append("# HELP container_restart_count Number of times the container has been restarted")
         output.append("# TYPE container_restart_count gauge")
 
-        for metric in self.metrics:
+        for metric in metrics:
             labels = f'container_name="{metric.name}",hostname="{metric.hostname.lower()}",image="{metric.image}"'
             output.append(f"container_restart_count{{{labels}}} {metric.restart_count}")
 
@@ -306,19 +323,19 @@ class PortainerExporter:
         output.append("# HELP portainer_endpoint_status Whether a Portainer endpoint is online (1) or offline (0)")
         output.append("# TYPE portainer_endpoint_status gauge")
 
-        for ep in self.endpoint_statuses:
+        for ep in endpoint_statuses:
             output.append(f'portainer_endpoint_status{{hostname="{ep.hostname}"}} {1 if ep.online else 0}')
 
         output.append("")
         output.append("# HELP portainer_exporter_up Whether the exporter is up and connected to Portainer")
         output.append("# TYPE portainer_exporter_up gauge")
-        up_status: int = 1 if self.last_error is None else 0
+        up_status: int = 1 if last_error is None else 0
         output.append(f"portainer_exporter_up {up_status}")
 
         output.append("")
         output.append("# HELP portainer_exporter_last_scrape_timestamp Unix timestamp of last successful scrape")
         output.append("# TYPE portainer_exporter_last_scrape_timestamp gauge")
-        output.append(f"portainer_exporter_last_scrape_timestamp {int(self.last_update)}")
+        output.append(f"portainer_exporter_last_scrape_timestamp {int(last_update)}")
 
         return "\n".join(output) + "\n"
 
@@ -328,6 +345,9 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
     exporter: PortainerExporter | None = None
     freshness: FreshnessCollector | None = None
+    # Per-connection socket timeout so a hung client cannot pin a handler
+    # thread indefinitely (applied by BaseHTTPRequestHandler.setup()).
+    timeout = 30
 
     def do_GET(self) -> None:
         if self.path == "/metrics":
@@ -343,8 +363,6 @@ class MetricsHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.end_headers()
-            import json
-
             if self.exporter is not None:
                 health = json.dumps({"status": "up", "last_error": self.exporter.last_error})
                 _ = self.wfile.write(health.encode("utf-8"))
@@ -360,7 +378,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
 def run_collector_thread(exporter: PortainerExporter, interval: int) -> Thread:
     """Run metrics collection in a background thread"""
 
-    def collector():
+    def collector() -> None:
         while True:
             exporter.collect_all_metrics()
             time.sleep(interval)
@@ -370,7 +388,7 @@ def run_collector_thread(exporter: PortainerExporter, interval: int) -> Thread:
     return thread
 
 
-def main():
+def main() -> None:
     logger.info("Starting Portainer Container Status Exporter")
 
     try:
@@ -392,8 +410,9 @@ def main():
             logger.info(f"Starting image freshness checks every {freshness.check_interval} seconds")
             _ = run_freshness_thread(freshness)
 
-        # Start HTTP server
-        server = HTTPServer(("0.0.0.0", exporter.listen_port), MetricsHandler)
+        # Start HTTP server (threaded so a slow/hung client can't block
+        # scrapes; ThreadingHTTPServer sets daemon_threads = True)
+        server = ThreadingHTTPServer(("0.0.0.0", exporter.listen_port), MetricsHandler)
         logger.info(f"Starting HTTP server on port {exporter.listen_port}")
         logger.info("Listening for Prometheus scrapes on /metrics")
 

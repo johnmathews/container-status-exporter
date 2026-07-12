@@ -45,25 +45,21 @@ class TestFetchEndpoints:
         assert len(endpoints) == 2
         assert endpoints[0]["Name"] == "docker-host-1"
 
-    def test_fetch_endpoints_api_error(self, exporter, mocker):
-        """Test handling of API errors when fetching endpoints."""
+    def test_fetch_endpoints_api_error_raises(self, exporter, mocker):
+        """API errors propagate so collect_all_metrics can tell failure from empty."""
         mock_response = MagicMock()
         mock_response.raise_for_status.side_effect = requests.RequestException("Connection failed")
         mocker.patch.object(exporter.session, "get", return_value=mock_response)
 
-        endpoints = exporter.fetch_endpoints()
+        with pytest.raises(requests.RequestException, match="Connection failed"):
+            exporter.fetch_endpoints()
 
-        assert endpoints == []
-        assert "Connection failed" in exporter.last_error
-
-    def test_fetch_endpoints_timeout(self, exporter, mocker):
-        """Test handling of timeout when fetching endpoints."""
+    def test_fetch_endpoints_timeout_raises(self, exporter, mocker):
+        """Timeouts propagate so collect_all_metrics can tell failure from empty."""
         mocker.patch.object(exporter.session, "get", side_effect=requests.Timeout("Request timed out"))
 
-        endpoints = exporter.fetch_endpoints()
-
-        assert endpoints == []
-        assert "Request timed out" in exporter.last_error
+        with pytest.raises(requests.Timeout, match="Request timed out"):
+            exporter.fetch_endpoints()
 
     def test_fetch_endpoints_calls_correct_url(self, exporter, sample_endpoints, mocker):
         """Test that correct API endpoint is called."""
@@ -155,16 +151,20 @@ class TestFetchContainers:
 
         assert containers[0].name == "my-container"
 
-    def test_fetch_containers_api_error(self, exporter, mocker):
-        """Test handling of API errors when fetching containers."""
+    def test_fetch_containers_api_error(self, exporter, mocker, caplog):
+        """Per-endpoint API errors are logged but do not set the fleet-wide error."""
+        import logging
+
         mock_response = MagicMock()
         mock_response.raise_for_status.side_effect = requests.RequestException("API error")
         mocker.patch.object(exporter.session, "get", return_value=mock_response)
 
-        containers = exporter.fetch_containers(1, "docker-host-1")
+        with caplog.at_level(logging.ERROR):
+            containers = exporter.fetch_containers(1, "docker-host-1")
 
         assert containers == []
-        assert "API error" in exporter.last_error
+        assert exporter.last_error is None
+        assert any("docker-host-1" in r.message for r in caplog.records if r.levelno == logging.ERROR)
 
     def test_fetch_containers_calls_correct_url(self, exporter, sample_containers, mocker):
         """Test that correct API endpoint is called."""
@@ -235,4 +235,5 @@ class TestCollectAllMetrics:
         exporter.collect_all_metrics()
 
         assert exporter.last_error == "Network error"
+        # Previous snapshot is retained; it was empty here.
         assert len(exporter.metrics) == 0

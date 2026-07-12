@@ -179,38 +179,51 @@ class TestHTTPErrorHandling:
         assert containers == []
         assert exporter.last_error is None
 
-    def test_500_treated_as_real_error(self, exporter, mocker):
-        """Test that HTTP 500 is treated as a real error."""
+    def test_500_treated_as_real_error(self, exporter, mocker, caplog):
+        """Test that HTTP 500 is logged at ERROR (unlike 502/503) without flipping exporter_up."""
+        import logging
+
         mock_response = MagicMock()
         mock_response.status_code = 500
         mock_response.raise_for_status.side_effect = requests.HTTPError("500 Server Error", response=mock_response)
         mocker.patch.object(exporter.session, "get", return_value=mock_response)
 
-        containers = exporter.fetch_containers(1, "error-host")
+        with caplog.at_level(logging.ERROR):
+            containers = exporter.fetch_containers(1, "error-host")
 
         assert containers == []
-        assert exporter.last_error is not None
+        assert any("error-host" in r.message for r in caplog.records if r.levelno == logging.ERROR)
+        # Per-endpoint failures never set the fleet-wide error.
+        assert exporter.last_error is None
 
-    def test_401_treated_as_real_error(self, exporter, mocker):
-        """Test that HTTP 401 is treated as a real error."""
+    def test_401_treated_as_real_error(self, exporter, mocker, caplog):
+        """Test that HTTP 401 is logged at ERROR (unlike 502/503) without flipping exporter_up."""
+        import logging
+
         mock_response = MagicMock()
         mock_response.status_code = 401
         mock_response.raise_for_status.side_effect = requests.HTTPError("401 Unauthorized", response=mock_response)
         mocker.patch.object(exporter.session, "get", return_value=mock_response)
 
-        containers = exporter.fetch_containers(1, "auth-error-host")
+        with caplog.at_level(logging.ERROR):
+            containers = exporter.fetch_containers(1, "auth-error-host")
 
         assert containers == []
-        assert exporter.last_error is not None
+        assert any("auth-error-host" in r.message for r in caplog.records if r.levelno == logging.ERROR)
+        assert exporter.last_error is None
 
-    def test_connection_error_treated_as_real_error(self, exporter, mocker):
-        """Test that connection errors are treated as real errors."""
+    def test_connection_error_treated_as_real_error(self, exporter, mocker, caplog):
+        """Test that connection errors are logged at ERROR without flipping exporter_up."""
+        import logging
+
         mocker.patch.object(exporter.session, "get", side_effect=requests.ConnectionError("Connection refused"))
 
-        containers = exporter.fetch_containers(1, "unreachable-host")
+        with caplog.at_level(logging.ERROR):
+            containers = exporter.fetch_containers(1, "unreachable-host")
 
         assert containers == []
-        assert "Connection refused" in exporter.last_error
+        assert any("Connection refused" in r.message for r in caplog.records if r.levelno == logging.ERROR)
+        assert exporter.last_error is None
 
 
 class TestLogMessages:

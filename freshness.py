@@ -46,9 +46,18 @@ STATUS_LOCAL = "local"  # locally-built image, no RepoDigests to compare
 STATUS_PINNED = "pinned"  # image pinned by digest (name@sha256:...), never outdated
 STATUS_ERROR = "error"  # registry check failed (dead repo, network, auth)
 
+# Anonymous pull tokens are cached this long (spec minimum; Hub issues ~300s tokens)
+TOKEN_TTL_SECONDS = 60.0
+# Backoff before the single retry of a transient digest-HEAD failure
+HEAD_RETRY_BACKOFF_SECONDS = 2.0
+
 
 class RegistryError(Exception):
     """Raised when a registry request fails."""
+
+
+class RegistryRateLimited(RegistryError):  # noqa: N818 -- condition, not error: image is fine, registry is busy
+    """Raised on HTTP 429: the registry is rate limiting us, the image is not broken."""
 
 
 @dataclass
@@ -126,6 +135,9 @@ class RegistryClient:
         self.session: requests.Session = requests.Session()
         # version/created metadata never changes for a given digest
         self._meta_cache: dict[str, tuple[str, float]] = {}
+        # anonymous pull tokens: (registry, repository) -> (token, fetched_at unix ts)
+        self.token_ttl: float = TOKEN_TTL_SECONDS
+        self._token_cache: dict[tuple[str, str], tuple[str, float]] = {}
 
     def _fetch_token(self, challenge: str, repository: str) -> str | None:
         """Fetch an anonymous pull token from the realm in a WWW-Authenticate challenge."""
@@ -138,6 +150,8 @@ class RegistryClient:
             query["service"] = params["service"]
         try:
             response = self.session.get(realm, params=query, timeout=self.timeout)
+            if response.status_code == 429:
+                raise RegistryRateLimited(f"Token fetch from {realm} -> HTTP 429 (rate limited)")
             response.raise_for_status()
             data: dict[str, Any] = response.json()
             token = data.get("token") or data.get("access_token")
@@ -147,23 +161,50 @@ class RegistryClient:
             return None
 
     def _request(self, method: str, ref: ImageRef, path: str, accept: str) -> requests.Response:
-        """Perform a registry request, transparently handling the 401 token dance."""
+        """
+        Perform a registry request, transparently handling the 401 token dance.
+
+        Anonymous tokens are cached per (registry, repository) for a short TTL;
+        a 401 while presenting a cached token invalidates it and re-fetches once
+        (the same single-retry semantics as the uncached dance). HTTP 429 raises
+        RegistryRateLimited so callers can degrade instead of reporting errors.
+        """
         url = f"https://{ref.registry}/v2/{ref.repository}/{path}"
         headers = {"Accept": accept}
+        key = (ref.registry, ref.repository)
+        cached = self._token_cache.get(key)
+        if cached is not None and time.time() - cached[1] < self.token_ttl:
+            headers["Authorization"] = f"Bearer {cached[0]}"
+        else:
+            self._token_cache.pop(key, None)
         response = self.session.request(method, url, headers=headers, timeout=self.timeout)
         if response.status_code == 401:
+            self._token_cache.pop(key, None)  # cached token stale/revoked
             challenge = response.headers.get("WWW-Authenticate", "")
             token = self._fetch_token(challenge, ref.repository)
             if token:
+                self._token_cache[key] = (token, time.time())
                 headers["Authorization"] = f"Bearer {token}"
                 response = self.session.request(method, url, headers=headers, timeout=self.timeout)
+        if response.status_code == 429:
+            raise RegistryRateLimited(f"{method} {url} -> HTTP 429 (rate limited)")
         if response.status_code != 200:
             raise RegistryError(f"{method} {url} -> HTTP {response.status_code}")
         return response
 
     def get_remote_digest(self, ref: ImageRef) -> str:
-        """HEAD the manifest for ref's tag and return its content digest."""
-        response = self._request("HEAD", ref, f"manifests/{ref.tag}", MANIFEST_ACCEPT)
+        """
+        HEAD the manifest for ref's tag and return its content digest.
+
+        Retries once after a short backoff on transient transport errors: the
+        HEAD is cheap, idempotent and exempt from Docker Hub pull-rate limits.
+        """
+        try:
+            response = self._request("HEAD", ref, f"manifests/{ref.tag}", MANIFEST_ACCEPT)
+        except requests.RequestException as e:
+            logger.debug(f"Transient error HEADing {ref.original}, retrying once: {e}")
+            time.sleep(HEAD_RETRY_BACKOFF_SECONDS)
+            response = self._request("HEAD", ref, f"manifests/{ref.tag}", MANIFEST_ACCEPT)
         digest = response.headers.get("Docker-Content-Digest", "")
         if not digest:
             raise RegistryError(f"No Docker-Content-Digest header from {ref.registry}/{ref.repository}")
@@ -235,6 +276,9 @@ class RemoteState:
     digest: str = ""
     version: str = ""
     created: float = 0.0
+    # 429 sentinel: consumers carry forward the previous result instead of using status.
+    # status stays STATUS_ERROR as a fail-safe for any path that ignores the flag.
+    rate_limited: bool = False
 
 
 class FreshnessCollector:
@@ -286,6 +330,11 @@ class FreshnessCollector:
                     # Metadata is decoration; the digest comparison already succeeded
                     logger.debug(f"No remote metadata for {image}: {e}")
                 state = RemoteState(status=STATUS_OK, digest=digest, version=version, created=created)
+            except RegistryRateLimited as e:
+                # Not a broken image: flag it so collect() degrades gracefully
+                # (one WARNING per cycle there, not one per image here)
+                logger.debug(f"Registry rate-limited for {image}: {e}")
+                state = RemoteState(status=STATUS_ERROR, rate_limited=True)
             except (RegistryError, requests.RequestException) as e:
                 logger.warning(f"Registry check failed for {image}: {e}")
                 state = RemoteState(status=STATUS_ERROR)
@@ -313,6 +362,9 @@ class FreshnessCollector:
 
         results: list[ImageFreshness] = []
         remote_cache: dict[str, RemoteState] = {}
+        # Previous cycle's results: carried forward for images the registry rate-limits
+        previous = {(r.hostname, r.container_name, r.image): r for r in self.results}
+        rate_limited_count = 0
 
         for endpoint in endpoints:
             if not isinstance(endpoint, dict):
@@ -368,6 +420,14 @@ class FreshnessCollector:
                     remote = RemoteState(status=STATUS_LOCAL)
                 else:
                     remote = self._check_remote(image, remote_cache)
+                    if remote.rate_limited:
+                        # Rate limiting says nothing about the image: keep last
+                        # cycle's verdict if we have one, otherwise omit it.
+                        rate_limited_count += 1
+                        carried = previous.get((hostname, name, image))
+                        if carried is not None:
+                            results.append(carried)
+                        continue
                     if remote.status == STATUS_OK:
                         status = STATUS_OK if remote.digest in repo_digests else STATUS_OUTDATED
                     else:
@@ -385,6 +445,12 @@ class FreshnessCollector:
                         available_created=remote.created,
                     )
                 )
+
+        if rate_limited_count:
+            logger.warning(
+                f"Freshness: registry rate limit (HTTP 429) affected {rate_limited_count} container(s) "
+                "this cycle; previous results carried forward where available"
+            )
 
         self.results = results
         self.last_check = time.time()

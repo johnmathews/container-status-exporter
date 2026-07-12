@@ -19,6 +19,7 @@ from freshness import (
     ImageRef,
     RegistryClient,
     RegistryError,
+    RegistryRateLimited,
     _collect_safely,
     parse_image_ref,
     parse_rfc3339,
@@ -512,3 +513,240 @@ class TestParseChallengeEdgeCases:
     def test_missing_realm_returns_none(self, mocker):
         client = RegistryClient()
         assert client._fetch_token('Bearer service="x"', "repo") is None
+
+
+class TestRegistryRateLimited:
+    """HTTP 429 must surface as a distinct exception, not a generic RegistryError."""
+
+    def test_is_a_registry_error_subclass(self):
+        assert issubclass(RegistryRateLimited, RegistryError)
+
+    def test_429_on_manifest_head_raises_rate_limited(self, mocker):
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        client.session.request.return_value = _response(mocker, 429)
+        with pytest.raises(RegistryRateLimited):
+            client.get_remote_digest(parse_image_ref("nginx:latest"))
+
+    def test_429_on_token_fetch_raises_rate_limited(self, mocker):
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        client.session.get.return_value = _response(mocker, 429)
+        challenge = 'Bearer realm="https://auth.docker.io/token",service="registry.docker.io"'
+        with pytest.raises(RegistryRateLimited):
+            client._fetch_token(challenge, "library/nginx")
+
+    @pytest.mark.parametrize("status", [401, 404, 500])
+    def test_non_429_http_errors_still_raise_plain_registry_error(self, mocker, status):
+        """The dead-repo signal (401/404/500 -> status=error) must survive 429 handling."""
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        client.session.request.return_value = _response(mocker, status)
+        with pytest.raises(RegistryError) as excinfo:
+            client.get_remote_digest(parse_image_ref("dead/repo:latest"))
+        assert not isinstance(excinfo.value, RegistryRateLimited)
+
+
+class TestHeadTransientRetry:
+    """The digest HEAD is cheap and idempotent: one retry after a short backoff."""
+
+    def test_transient_error_then_success(self, mocker):
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        head = _response(mocker, 200, {"Docker-Content-Digest": "sha256:abc"})
+        client.session.request.side_effect = [requests.ConnectionError("connection reset"), head]
+        sleep = mocker.patch("freshness.time.sleep")
+
+        assert client.get_remote_digest(parse_image_ref("nginx:latest")) == "sha256:abc"
+        assert client.session.request.call_count == 2
+        sleep.assert_called_once()
+        assert sleep.call_args[0][0] == pytest.approx(2, abs=0.5)
+
+    def test_second_transient_failure_propagates(self, mocker):
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        client.session.request.side_effect = requests.ConnectionError("still down")
+        mocker.patch("freshness.time.sleep")
+
+        with pytest.raises(requests.RequestException):
+            client.get_remote_digest(parse_image_ref("nginx:latest"))
+        assert client.session.request.call_count == 2
+
+
+class TestTokenCache:
+    """Anonymous tokens are cached per (registry, repository) with a short TTL."""
+
+    CHALLENGE = 'Bearer realm="https://auth.docker.io/token",service="registry.docker.io"'
+
+    def _client(self, mocker) -> RegistryClient:
+        client = RegistryClient()
+        client.session = mocker.MagicMock()
+        return client
+
+    def test_second_request_within_ttl_reuses_cached_token(self, mocker):
+        client = self._client(mocker)
+        unauthorized = _response(mocker, 401, {"WWW-Authenticate": self.CHALLENGE})
+        ok1 = _response(mocker, 200, {"Docker-Content-Digest": "sha256:a"})
+        ok2 = _response(mocker, 200, {"Docker-Content-Digest": "sha256:a"})
+        client.session.request.side_effect = [unauthorized, ok1, ok2]
+        client.session.get.return_value = _response(mocker, 200, body={"token": "tok1"})
+
+        ref = parse_image_ref("nginx:latest")
+        assert client.get_remote_digest(ref) == "sha256:a"
+        assert client.get_remote_digest(ref) == "sha256:a"
+
+        # auth endpoint hit exactly once; second request carried the cached token up front
+        assert client.session.get.call_count == 1
+        assert client.session.request.call_count == 3
+        _, kwargs = client.session.request.call_args
+        assert kwargs["headers"]["Authorization"] == "Bearer tok1"
+
+    def test_expired_ttl_refetches_token(self, mocker):
+        client = self._client(mocker)
+        client.token_ttl = 0.0  # everything is instantly stale
+        unauthorized1 = _response(mocker, 401, {"WWW-Authenticate": self.CHALLENGE})
+        ok1 = _response(mocker, 200, {"Docker-Content-Digest": "sha256:a"})
+        unauthorized2 = _response(mocker, 401, {"WWW-Authenticate": self.CHALLENGE})
+        ok2 = _response(mocker, 200, {"Docker-Content-Digest": "sha256:a"})
+        client.session.request.side_effect = [unauthorized1, ok1, unauthorized2, ok2]
+        client.session.get.return_value = _response(mocker, 200, body={"token": "tok"})
+
+        ref = parse_image_ref("nginx:latest")
+        client.get_remote_digest(ref)
+        client.get_remote_digest(ref)
+
+        assert client.session.get.call_count == 2
+
+    def test_401_with_cached_token_invalidates_and_refetches_once(self, mocker):
+        client = self._client(mocker)
+        unauthorized1 = _response(mocker, 401, {"WWW-Authenticate": self.CHALLENGE})
+        ok1 = _response(mocker, 200, {"Docker-Content-Digest": "sha256:a"})
+        # second call: cached token rejected (revoked), one re-dance, then success
+        unauthorized2 = _response(mocker, 401, {"WWW-Authenticate": self.CHALLENGE})
+        ok2 = _response(mocker, 200, {"Docker-Content-Digest": "sha256:b"})
+        client.session.request.side_effect = [unauthorized1, ok1, unauthorized2, ok2]
+        token1 = _response(mocker, 200, body={"token": "tok1"})
+        token2 = _response(mocker, 200, body={"token": "tok2"})
+        client.session.get.side_effect = [token1, token2]
+
+        ref = parse_image_ref("nginx:latest")
+        assert client.get_remote_digest(ref) == "sha256:a"
+        assert client.get_remote_digest(ref) == "sha256:b"
+
+        assert client.session.get.call_count == 2
+        _, kwargs = client.session.request.call_args
+        assert kwargs["headers"]["Authorization"] == "Bearer tok2"
+
+    def test_cache_is_keyed_per_repository(self, mocker):
+        client = self._client(mocker)
+        unauthorized1 = _response(mocker, 401, {"WWW-Authenticate": self.CHALLENGE})
+        ok1 = _response(mocker, 200, {"Docker-Content-Digest": "sha256:a"})
+        unauthorized2 = _response(mocker, 401, {"WWW-Authenticate": self.CHALLENGE})
+        ok2 = _response(mocker, 200, {"Docker-Content-Digest": "sha256:b"})
+        client.session.request.side_effect = [unauthorized1, ok1, unauthorized2, ok2]
+        client.session.get.return_value = _response(mocker, 200, body={"token": "tok"})
+
+        client.get_remote_digest(parse_image_ref("nginx:latest"))
+        client.get_remote_digest(parse_image_ref("jellyfin/jellyfin:latest"))
+
+        # different repository -> different scope -> its own token dance
+        assert client.session.get.call_count == 2
+
+
+class TestRateLimitGracefulDegradation:
+    """A rate-limited cycle must not flip previously-known images to status=error."""
+
+    CONTAINERS = [{"Names": ["/web"], "Image": "nginx:latest", "ImageID": "sha256:img"}]
+    INSPECTED = {"Created": "2026-01-01T00:00:00Z", "Config": {}, "RepoDigests": ["nginx@sha256:old"]}
+
+    def _wire_portainer(self, mocker, collector, containers, inspected):
+        def get_json(path: str) -> Any:
+            if path == "/api/endpoints":
+                return [{"Id": 1, "Name": "host-a", "Status": 1}]
+            if path.endswith("/docker/containers/json"):
+                return containers
+            if "/docker/images/" in path:
+                return inspected
+            raise AssertionError(f"unexpected path {path}")
+
+        mocker.patch.object(collector, "_get_json", side_effect=get_json)
+
+    def test_429_with_previous_result_carries_it_forward(self, mocker, monkeypatch, caplog):
+        collector = _collector(monkeypatch)
+        collector.results = [ImageFreshness("web", "host-a", "nginx:latest", STATUS_OUTDATED, available_version="1.28")]
+        self._wire_portainer(mocker, collector, self.CONTAINERS, self.INSPECTED)
+        mocker.patch.object(collector.registry, "get_remote_digest", side_effect=RegistryRateLimited("429"))
+
+        with caplog.at_level(logging.WARNING, logger="freshness"):
+            collector.collect()
+
+        assert len(collector.results) == 1
+        carried = collector.results[0]
+        assert carried.status == STATUS_OUTDATED
+        assert carried.available_version == "1.28"
+        assert not any(r.status == STATUS_ERROR for r in collector.results)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "429" in warnings[0].getMessage()
+
+    def test_429_with_no_previous_result_omits_image(self, mocker, monkeypatch):
+        collector = _collector(monkeypatch)
+        collector.results = []
+        self._wire_portainer(mocker, collector, self.CONTAINERS, self.INSPECTED)
+        mocker.patch.object(collector.registry, "get_remote_digest", side_effect=RegistryRateLimited("429"))
+
+        collector.collect()
+
+        assert collector.results == []
+        assert collector.last_check > 0
+
+    def test_429_does_not_contaminate_remote_cache_for_other_containers(self, mocker, monkeypatch, caplog):
+        """Two containers share one image: one 429 must not error either, and warns once."""
+        collector = _collector(monkeypatch)
+        collector.results = [ImageFreshness("web1", "host-a", "nginx:latest", STATUS_OK)]
+        containers = [
+            {"Names": ["/web1"], "Image": "nginx:latest", "ImageID": "sha256:img"},
+            {"Names": ["/web2"], "Image": "nginx:latest", "ImageID": "sha256:img"},
+        ]
+        self._wire_portainer(mocker, collector, containers, self.INSPECTED)
+        digest = mocker.patch.object(collector.registry, "get_remote_digest", side_effect=RegistryRateLimited("429"))
+
+        with caplog.at_level(logging.WARNING, logger="freshness"):
+            collector.collect()
+
+        assert digest.call_count == 1  # per-cycle cache still deduplicates the image
+        assert not any(r.status == STATUS_ERROR for r in collector.results)
+        statuses = {r.container_name: r.status for r in collector.results}
+        assert statuses == {"web1": STATUS_OK}  # web2 had no previous result -> absent
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+
+    def test_non_429_registry_error_still_yields_error_status(self, mocker, monkeypatch):
+        """Graceful degradation is 429-only: dead repos must keep reading status=error."""
+        collector = _collector(monkeypatch)
+        collector.results = [ImageFreshness("web", "host-a", "nginx:latest", STATUS_OK)]
+        self._wire_portainer(mocker, collector, self.CONTAINERS, self.INSPECTED)
+        mocker.patch.object(collector.registry, "get_remote_digest", side_effect=RegistryError("HTTP 401"))
+
+        collector.collect()
+
+        assert len(collector.results) == 1
+        assert collector.results[0].status == STATUS_ERROR
+
+    def test_transient_head_blip_recovers_within_cycle(self, mocker, monkeypatch):
+        """ConnectionError then success on the HEAD retry -> normal verdict, two HEADs, ~2s backoff."""
+        collector = _collector(monkeypatch)
+        self._wire_portainer(mocker, collector, self.CONTAINERS, self.INSPECTED)
+        collector.registry.session = mocker.MagicMock()
+        head = _response(mocker, 200, {"Docker-Content-Digest": "sha256:old"})
+        collector.registry.session.request.side_effect = [requests.ConnectionError("blip"), head]
+        mocker.patch.object(collector.registry, "get_remote_metadata", return_value=("", 0.0))
+        sleep = mocker.patch("freshness.time.sleep")
+
+        collector.collect()
+
+        assert len(collector.results) == 1
+        assert collector.results[0].status == STATUS_OK  # sha256:old matches RepoDigests
+        assert collector.registry.session.request.call_count == 2
+        sleep.assert_called_once()
+        assert sleep.call_args[0][0] == pytest.approx(2, abs=0.5)

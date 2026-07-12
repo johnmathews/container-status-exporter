@@ -2,12 +2,12 @@
 
 ## Project Principles
 
-- **Single-file application**: All logic lives in `app.py`. Keep it this way for transparency and ease of deployment.
+- **Two small files, no framework**: container state lives in `app.py`, image freshness in `freshness.py`. Keep it this flat for transparency and ease of deployment.
 - **Minimal dependencies**: Only `requests` at runtime. No frameworks.
 
 ## Editing Guardrails
 
-- **Metric names and label structure** (`container_state`, `container_health`, `container_restart_count`, `portainer_exporter_up`, `portainer_exporter_last_scrape_timestamp`) must not be changed without updating downstream Prometheus queries and Grafana dashboards.
+- **Metric names and label structure** (`container_state`, `container_health`, `container_restart_count`, `portainer_exporter_up`, `portainer_exporter_last_scrape_timestamp`, `container_image_outdated`, `container_image_info`, `container_image_current_created_timestamp`, `container_image_available_created_timestamp`) must not be changed without updating downstream Prometheus queries and Grafana dashboards.
 - HTTP response format must remain Prometheus text exposition format compliant (HELP/TYPE comments, `metric_name{labels} value` lines).
 
 ## Development
@@ -27,3 +27,7 @@
 | `SCRAPE_INTERVAL` | `30` | Seconds between metric collections |
 | `LISTEN_PORT` | `8081` | HTTP server port |
 | `LOG_LEVEL` | `INFO` | Python logging level |
+| `FRESHNESS_ENABLED` | `true` | Enable image freshness checks (registry digest comparison) |
+| `REGISTRY_CHECK_INTERVAL` | `21600` | Seconds between registry freshness cycles (6h) |
+| `REGISTRY_TIMEOUT` | `10` | Per-request timeout for registry calls |
+| `REGISTRY_PLATFORM` | `linux/amd64` | Platform used to resolve multi-arch manifests |

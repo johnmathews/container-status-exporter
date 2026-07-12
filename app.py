@@ -18,6 +18,8 @@ from typing import Any, cast
 
 import requests
 
+from freshness import FreshnessCollector, run_freshness_thread
+
 # Configure logging
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -325,6 +327,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
     """HTTP request handler for /metrics endpoint"""
 
     exporter: PortainerExporter | None = None
+    freshness: FreshnessCollector | None = None
 
     def do_GET(self) -> None:
         if self.path == "/metrics":
@@ -333,6 +336,8 @@ class MetricsHandler(BaseHTTPRequestHandler):
             self.end_headers()
             if self.exporter is not None:
                 metrics = self.exporter.generate_metrics_output()
+                if self.freshness is not None:
+                    metrics += "\n" + self.freshness.generate_output()
                 _ = self.wfile.write(metrics.encode("utf-8"))
         elif self.path == "/health":
             self.send_response(200)
@@ -379,6 +384,13 @@ def main():
         # Start background collection thread
         logger.info(f"Starting background collection every {exporter.scrape_interval} seconds")
         _ = run_collector_thread(exporter, exporter.scrape_interval)
+
+        # Start image-freshness collection thread (registry digest comparison)
+        if os.getenv("FRESHNESS_ENABLED", "true").lower() in ("1", "true", "yes"):
+            freshness = FreshnessCollector()
+            MetricsHandler.freshness = freshness
+            logger.info(f"Starting image freshness checks every {freshness.check_interval} seconds")
+            _ = run_freshness_thread(freshness)
 
         # Start HTTP server
         server = HTTPServer(("0.0.0.0", exporter.listen_port), MetricsHandler)

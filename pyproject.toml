@@ -1,6 +1,6 @@
 [project]
 name = "container-status-exporter"
-version = "1.0.0"
+version = "1.1.0"
 description = "Prometheus exporter for Docker container status via Portainer API"
 readme = "README.md"
 requires-python = ">=3.11"

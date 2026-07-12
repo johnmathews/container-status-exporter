@@ -9,7 +9,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 # Copy application
-COPY app.py .
+COPY app.py freshness.py .
 
 # Create non-root user for security
 RUN useradd -m -u 1000 exporter && chown -R exporter:exporter /app

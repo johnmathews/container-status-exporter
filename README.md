@@ -11,6 +11,9 @@ A Prometheus exporter that exports Docker container status and health metrics fr
 - Graceful handling of offline endpoints (skipped, not errored)
 - Prometheus-compatible text format output
 - Built-in health check endpoint
+- **Image freshness**: compares each running container's image digest against the
+  upstream registry (anonymous OCI token flow — Docker Hub, ghcr, quay, gcr, lscr)
+  and exposes `container_image_outdated` plus current/available version labels
 
 ## Quick Start
 
@@ -34,6 +37,10 @@ curl http://localhost:8081/metrics
 | `SCRAPE_INTERVAL` | `30` | Seconds between metric collections |
 | `LISTEN_PORT` | `8081` | HTTP server port |
 | `LOG_LEVEL` | `INFO` | Python logging level |
+| `FRESHNESS_ENABLED` | `true` | Enable image freshness checks (registry digest comparison) |
+| `REGISTRY_CHECK_INTERVAL` | `21600` | Seconds between registry freshness cycles (6h) |
+| `REGISTRY_TIMEOUT` | `10` | Per-request timeout for registry calls |
+| `REGISTRY_PLATFORM` | `linux/amd64` | Platform used to resolve multi-arch manifests |
 
 ## Development
 

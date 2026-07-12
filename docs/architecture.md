@@ -93,3 +93,36 @@ Portainer tracks Docker host availability. Each endpoint in the `/api/endpoints`
 ## Configuration
 
 All configuration is via environment variables. See [CLAUDE.md](../CLAUDE.md) for the full table.
+
+## Image Freshness (`freshness.py`)
+
+A second background thread (default every 6 hours) answers "is a newer image
+available for what is running?":
+
+1. For every online Portainer endpoint, list containers and inspect each unique
+   image (`GET /api/endpoints/{id}/docker/images/{id}/json`) for its
+   `RepoDigests`, OCI version label, and build date.
+2. For every unique image reference across the fleet, HEAD the manifest at the
+   upstream registry to get the digest currently served for that tag.
+   Anonymous auth uses the standard OCI token dance (401 -> WWW-Authenticate ->
+   pull-scoped bearer token), which works for Docker Hub, ghcr.io, quay.io,
+   gcr.io and lscr.io. HEAD requests do not count against Hub pull limits.
+3. If the registry digest is not among the running image's `RepoDigests`, the
+   container is `outdated`. Version and build-date metadata for the remote
+   image comes from its config blob and is cached by digest (immutable).
+
+Statuses: `ok`, `outdated`, `local` (locally-built image, nothing to compare),
+`pinned` (digest-pinned reference, immutable), `error` (registry check failed).
+
+### Freshness metrics
+
+```
+container_image_outdated{container_name, hostname, image} 0|1
+container_image_info{container_name, hostname, image, status, current_version, available_version} 1
+container_image_current_created_timestamp{container_name, hostname, image} <unix ts>
+container_image_available_created_timestamp{container_name, hostname, image} <unix ts>
+container_image_freshness_last_check_timestamp <unix ts>
+```
+
+Timestamps are only emitted when known, so "days behind" can be computed as
+`available - current` without NaN noise.

@@ -13,7 +13,9 @@ A Prometheus exporter that exports Docker container status and health metrics fr
 - Built-in health check endpoint
 - **Image freshness**: compares each running container's image digest against the
   upstream registry (anonymous OCI token flow — Docker Hub, ghcr, quay, gcr, lscr)
-  and exposes `container_image_outdated` plus current/available version labels
+  and exposes `container_image_outdated` plus current/available version labels;
+  locally-built images that declare `org.opencontainers.image.base.name` get
+  base-image freshness tracking
 
 ## Quick Start
 

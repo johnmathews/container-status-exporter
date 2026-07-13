@@ -7,7 +7,7 @@
 
 ## Editing Guardrails
 
-- **Metric names and label structure** (`container_state`, `container_health`, `container_restart_count`, `portainer_endpoint_status`, `portainer_exporter_up`, `portainer_exporter_last_scrape_timestamp`, `container_image_outdated`, `container_image_info`, `container_image_current_created_timestamp`, `container_image_available_created_timestamp`, `container_image_freshness_last_check_timestamp`) must not be changed without updating downstream Prometheus queries and Grafana dashboards. This is the complete 11-family surface, locked by `tests/test_contract.py`.
+- **Metric names and label structure** (`container_state`, `container_health`, `container_restart_count`, `portainer_endpoint_status`, `portainer_exporter_up`, `portainer_exporter_last_scrape_timestamp`, `container_image_outdated`, `container_image_info` (incl. its `base_image` label), `container_image_current_created_timestamp`, `container_image_available_created_timestamp`, `container_image_freshness_last_check_timestamp`) must not be changed without updating downstream Prometheus queries and Grafana dashboards. This is the complete 11-family surface, locked by `tests/test_contract.py`.
 - HTTP response format must remain Prometheus text exposition format compliant (HELP/TYPE comments, `metric_name{labels} value` lines).
 
 ## Downstream Consumers

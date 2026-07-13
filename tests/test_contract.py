@@ -32,7 +32,7 @@ FROZEN_CONTRACT: dict[str, frozenset[str]] = {
     # freshness.py: FreshnessCollector.generate_output()
     "container_image_outdated": frozenset({"container_name", "hostname", "image"}),
     "container_image_info": frozenset(
-        {"container_name", "hostname", "image", "status", "current_version", "available_version"}
+        {"container_name", "hostname", "image", "status", "current_version", "available_version", "base_image"}
     ),
     "container_image_current_created_timestamp": frozenset({"container_name", "hostname", "image"}),
     "container_image_available_created_timestamp": frozenset({"container_name", "hostname", "image"}),

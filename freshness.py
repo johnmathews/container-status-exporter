@@ -39,6 +39,9 @@ MANIFEST_ACCEPT = ", ".join(
 
 VERSION_LABEL = "org.opencontainers.image.version"
 CREATED_LABEL = "org.opencontainers.image.created"
+# Standard OCI annotation naming the base image a local build was built FROM.
+# Locally-built images that carry it get base-image freshness tracking.
+BASE_NAME_LABEL = "org.opencontainers.image.base.name"
 
 # Freshness status values (exposed as the `status` label on container_image_info)
 STATUS_OK = "ok"  # running digest matches the registry
@@ -325,6 +328,9 @@ class ImageFreshness:
     available_version: str = ""
     current_created: float = 0.0
     available_created: float = 0.0
+    # For local builds tracked via the OCI base-image annotation: the base ref
+    # the freshness verdict actually refers to (empty otherwise)
+    base_image: str = ""
 
     @property
     def outdated(self) -> int:
@@ -413,6 +419,43 @@ class FreshnessCollector:
         cache[image] = state
         return state
 
+    def _check_base(
+        self,
+        endpoint_id: int,
+        base_name: str,
+        inspect_cache: dict[str, dict[str, Any]],
+        remote_cache: dict[str, RemoteState],
+    ) -> tuple[RemoteState, set[str]] | None:
+        """
+        Resolve base-image freshness for a locally-built image.
+
+        Returns (registry state for the base ref, RepoDigests of the base as it
+        exists locally on the endpoint), or None when the base cannot be tracked
+        (digest-pinned annotation, base image not present locally, or the local
+        base has no RepoDigests). Comparing the LOCAL base tag against the
+        registry assumes pull and rebuild happen together (make <app>-upgrade
+        does); a pull without a rebuild reports ok until the rebuild lands.
+        """
+        if "@" in base_name:
+            logger.debug(f"Freshness: base annotation is digest-pinned, nothing to track: {base_name}")
+            return None
+        try:
+            if base_name not in inspect_cache:
+                inspect_cache[base_name] = self._inspect_image(endpoint_id, base_name)
+            base_inspected = inspect_cache[base_name]
+        except requests.RequestException as e:
+            logger.debug(f"Freshness: base image {base_name} not inspectable on endpoint {endpoint_id}: {e}")
+            return None
+        base_repo_digests = {
+            entry.split("@", 1)[1]
+            for entry in cast(list[str], base_inspected.get("RepoDigests") or [])
+            if "@" in entry
+        }
+        if not base_repo_digests:
+            logger.debug(f"Freshness: base image {base_name} has no RepoDigests, cannot compare")
+            return None
+        return self._check_remote(base_name, remote_cache), base_repo_digests
+
     # -- Collection --------------------------------------------------------
 
     def collect(self) -> None:
@@ -483,14 +526,34 @@ class FreshnessCollector:
                     if "@" in entry
                 }
 
+                base_image = ""
                 if "@" in image:
                     status = STATUS_PINNED
                     remote = RemoteState(status=STATUS_PINNED)
                 elif is_image_id(image) or not repo_digests:
-                    # Bare image IDs name no repository; like locally-built
-                    # images there is nothing upstream to compare against.
-                    status = STATUS_LOCAL
-                    remote = RemoteState(status=STATUS_LOCAL)
+                    # Bare image IDs and local builds have nothing upstream that
+                    # matches the image itself -- but a build that names its base
+                    # via the OCI annotation is checked against the base's tag.
+                    base_name = labels.get(BASE_NAME_LABEL, "")
+                    base = (
+                        self._check_base(endpoint_id, base_name, inspect_cache, remote_cache) if base_name else None
+                    )
+                    if base is None:
+                        status = STATUS_LOCAL
+                        remote = RemoteState(status=STATUS_LOCAL)
+                    else:
+                        remote, base_repo_digests = base
+                        base_image = base_name
+                        if remote.rate_limited:
+                            rate_limited_count += 1
+                            carried = previous.get((hostname, name, image))
+                            if carried is not None:
+                                results.append(carried)
+                            continue
+                        if remote.status == STATUS_OK:
+                            status = STATUS_OK if remote.digest in base_repo_digests else STATUS_OUTDATED
+                        else:
+                            status = remote.status
                 else:
                     remote = self._check_remote(image, remote_cache)
                     if remote.rate_limited:
@@ -516,6 +579,7 @@ class FreshnessCollector:
                         available_version=remote.version,
                         current_created=current_created,
                         available_created=remote.created,
+                        base_image=base_image,
                     )
                 )
 
@@ -550,8 +614,8 @@ class FreshnessCollector:
 
         output.append("")
         output.append(
-            "# HELP container_image_info Image freshness detail "
-            "(status: ok|outdated|local|pinned|error; versions from OCI labels where published)"
+            "# HELP container_image_info Image freshness detail (status: ok|outdated|local|pinned|error; "
+            "versions from OCI labels; base_image set for local builds tracked via the OCI base annotation)"
         )
         output.append("# TYPE container_image_info gauge")
         for r in results:
@@ -560,7 +624,8 @@ class FreshnessCollector:
                 f'hostname="{escape_label_value(r.hostname)}",image="{escape_label_value(r.image)}",'
                 f'status="{escape_label_value(r.status)}",'
                 f'current_version="{escape_label_value(r.current_version)}",'
-                f'available_version="{escape_label_value(r.available_version)}"'
+                f'available_version="{escape_label_value(r.available_version)}",'
+                f'base_image="{escape_label_value(r.base_image)}"'
             )
             output.append(f"container_image_info{{{labels}}} 1")
 

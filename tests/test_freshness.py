@@ -376,7 +376,7 @@ class TestFreshnessCollector:
         output = collector.generate_output()
         assert (
             'container_image_info{container_name="web",hostname="host-a",image="nginx:latest",'
-            'status="error",current_version="",available_version=""} 1'
+            'status="error",current_version="",available_version="",base_image=""} 1'
         ) in output
 
     def test_endpoints_fetch_failure_keeps_previous_results(self, mocker, monkeypatch):
@@ -940,3 +940,122 @@ class TestCheckRemotePinnedLeak:
         collector = _collector(monkeypatch)
         state = collector._check_remote("valkey/valkey:8@sha256:fea8", {})
         assert state.status == STATUS_ERROR
+
+
+class TestBaseImageFreshness:
+    """Local builds carrying the OCI base-image annotation get base freshness tracking."""
+
+    BASE_LABEL = "org.opencontainers.image.base.name"
+
+    def _wire(self, mocker, monkeypatch, container_labels, base_inspect=None):
+        collector = _collector(monkeypatch)
+
+        def get_json(path: str) -> Any:
+            if path == "/api/endpoints":
+                return [{"Id": 1, "Name": "host-a", "Status": 1}]
+            if path.endswith("/docker/containers/json"):
+                return [{"Names": ["/jf"], "Image": "local-build:latest", "ImageID": "sha256:img"}]
+            if "/docker/images/sha256:img/json" in path:
+                return {"Created": "2026-07-12T00:00:00Z", "Config": {"Labels": container_labels}, "RepoDigests": []}
+            if "/docker/images/jellyfin/jellyfin:latest/json" in path:
+                if base_inspect is None:
+                    raise requests.RequestException("no such image")
+                return base_inspect
+            raise AssertionError(f"unexpected path {path}")
+
+        mocker.patch.object(collector, "_get_json", side_effect=get_json)
+        return collector
+
+    def test_base_up_to_date(self, mocker, monkeypatch):
+        collector = self._wire(
+            mocker, monkeypatch,
+            container_labels={self.BASE_LABEL: "jellyfin/jellyfin:latest",
+                              "org.opencontainers.image.version": "10.11.11"},
+            base_inspect={"RepoDigests": ["jellyfin/jellyfin@sha256:samebase"]},
+        )
+        mocker.patch.object(collector.registry, "get_remote_digest", return_value="sha256:samebase")
+        mocker.patch.object(collector.registry, "get_remote_metadata", return_value=("10.11.11", 1780000000.0))
+
+        collector.collect()
+        result = collector.results[0]
+        assert result.status == STATUS_OK
+        assert result.base_image == "jellyfin/jellyfin:latest"
+        assert result.outdated == 0
+
+    def test_base_outdated(self, mocker, monkeypatch):
+        collector = self._wire(
+            mocker, monkeypatch,
+            container_labels={self.BASE_LABEL: "jellyfin/jellyfin:latest"},
+            base_inspect={"RepoDigests": ["jellyfin/jellyfin@sha256:oldbase"]},
+        )
+        mocker.patch.object(collector.registry, "get_remote_digest", return_value="sha256:newbase")
+        mocker.patch.object(collector.registry, "get_remote_metadata", return_value=("10.11.12", 1790000000.0))
+
+        collector.collect()
+        result = collector.results[0]
+        assert result.status == STATUS_OUTDATED
+        assert result.outdated == 1
+        assert result.available_version == "10.11.12"
+        assert result.base_image == "jellyfin/jellyfin:latest"
+
+    def test_no_annotation_stays_local(self, mocker, monkeypatch):
+        collector = self._wire(mocker, monkeypatch, container_labels={})
+        remote = mocker.patch.object(collector.registry, "get_remote_digest")
+
+        collector.collect()
+        assert collector.results[0].status == STATUS_LOCAL
+        assert collector.results[0].base_image == ""
+        remote.assert_not_called()
+
+    def test_base_missing_locally_stays_local(self, mocker, monkeypatch):
+        collector = self._wire(
+            mocker, monkeypatch,
+            container_labels={self.BASE_LABEL: "jellyfin/jellyfin:latest"},
+            base_inspect=None,  # inspect raises
+        )
+        collector.collect()
+        assert collector.results[0].status == STATUS_LOCAL
+
+    def test_digest_pinned_annotation_stays_local(self, mocker, monkeypatch):
+        collector = self._wire(
+            mocker, monkeypatch,
+            container_labels={self.BASE_LABEL: "jellyfin/jellyfin@sha256:abc"},
+        )
+        collector.collect()
+        assert collector.results[0].status == STATUS_LOCAL
+
+    def test_base_without_repodigests_stays_local(self, mocker, monkeypatch):
+        collector = self._wire(
+            mocker, monkeypatch,
+            container_labels={self.BASE_LABEL: "jellyfin/jellyfin:latest"},
+            base_inspect={"RepoDigests": []},
+        )
+        collector.collect()
+        assert collector.results[0].status == STATUS_LOCAL
+
+    def test_base_rate_limited_carries_forward(self, mocker, monkeypatch):
+        collector = self._wire(
+            mocker, monkeypatch,
+            container_labels={self.BASE_LABEL: "jellyfin/jellyfin:latest"},
+            base_inspect={"RepoDigests": ["jellyfin/jellyfin@sha256:oldbase"]},
+        )
+        prior = ImageFreshness("jf", "host-a", "local-build:latest", STATUS_OUTDATED,
+                               base_image="jellyfin/jellyfin:latest")
+        collector.results = [prior]
+        from freshness import RegistryRateLimited
+        mocker.patch.object(collector.registry, "get_remote_digest",
+                            side_effect=RegistryRateLimited("429"))
+
+        collector.collect()
+        assert collector.results == [prior]
+
+    def test_base_image_label_rendered(self, monkeypatch):
+        collector = _collector(monkeypatch)
+        collector.results = [
+            ImageFreshness("jf", "host-a", "local-build:latest", STATUS_OUTDATED,
+                           base_image="jellyfin/jellyfin:latest"),
+            ImageFreshness("web", "host-a", "nginx:latest", STATUS_OK),
+        ]
+        output = collector.generate_output()
+        assert 'base_image="jellyfin/jellyfin:latest"' in output
+        assert 'container_name="web"' in output and 'base_image=""' in output
